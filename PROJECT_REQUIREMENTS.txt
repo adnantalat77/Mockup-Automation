@@ -1,0 +1,301 @@
+# Project: Mockup-Automation
+## Equipd Wear — Shopify Product Mockup Automation Manager
+
+### 1. Project Overview
+
+I am developing a custom web-based application called **Mockup-Automation** for my Shopify apparel store, **Equipd Wear**.
+
+Equipd Wear sells print-on-demand apparel, including T-shirts featuring designs from collections such as Texas Heritage, National Parks, and Outdoors & Adventure.
+
+We use **Shopify** as our e-commerce platform and **Printful** as our print-on-demand supplier.
+
+The purpose of this application is to automate the creation and publishing of professional product mockup images by placing existing transparent Printful shirt images over custom background images.
+
+**The application must never modify the actual shirt, its printed design, color, texture, or appearance.**
+
+The only intended image transformation is placing a custom background behind the original transparent product image.
+
+### 2. Development Environment
+
+We have decided to use the following technology stack:
+
+| Component | Technology |
+|---|---|
+| Project name | Mockup-Automation |
+| Store name | Equipd Wear |
+| Operating system | Windows |
+| IDE | Visual Studio Code |
+| AI development assistant | OpenAI Codex |
+| Frontend | React + TypeScript |
+| Backend | Node.js + TypeScript |
+| Image processing | Sharp |
+| Database | SQLite |
+| Shopify integration | Shopify Admin GraphQL API |
+| Version control | Git + GitHub |
+| Initial hosting | Local Windows computer |
+| Application URL | http://localhost:3000 (proposed) |
+
+The application will initially run entirely on my local computer.
+
+It must communicate securely with Shopify over the internet but does not need to be publicly accessible.
+
+Design the application so it can eventually be deployed to a private hosted environment without requiring a major rewrite.
+
+### 3. Core Application Workflow
+
+The application must support the following workflow.
+
+**Step 1 — Search Shopify Product**
+
+- Provide a text input where I can enter the exact Shopify product title.
+- Search the Equipd Wear Shopify catalog using the Admin GraphQL API.
+- Display matching products if more than one result is found.
+- Allow me to select the correct product.
+- Retrieve the product's existing images, variants, colors, sizes, and image associations.
+
+**Step 2 — Retrieve Existing Product Mockups**
+
+- Load the original product mockup images supplied by Printful.
+- Determine which images correspond to each shirt color.
+- Identify unique mockups shared by multiple size variants.
+- Avoid generating duplicate images for different sizes when the source mockup is identical.
+- Verify whether each source PNG contains a transparent alpha channel.
+- If an image is not transparent, display a warning rather than silently modifying the shirt.
+
+**Step 3 — Upload Background Image**
+
+- Provide an interface for uploading a background image from my computer.
+- Support PNG and JPEG backgrounds.
+- Display a preview of the uploaded background.
+- Allow reusable background images to be saved in a local background library.
+- Use one selected background for every variant of the selected product.
+
+Backgrounds may include rustic Texas scenes, national park scenery, camping equipment, or other lifestyle settings.
+
+**Step 4 — Generate Product Mockups**
+
+- Use Sharp to composite the original transparent shirt PNG over the selected background.
+- Preserve the original shirt pixels, design, fabric details, and colors.
+- Do not use generative AI to recreate or alter the garment.
+- Do not recolor or distort the shirt.
+- Preserve the shirt's aspect ratio.
+- If necessary, position or uniformly scale the entire unchanged shirt image to fit the background composition.
+- Do not crop the shirt.
+- Produce high-quality images suitable for Shopify product listings.
+- Preserve the original source images.
+
+**Step 5 — Apply Background to All Variants**
+
+This is a mandatory requirement.
+
+When I select a product and background, the application must process every applicable product variant.
+
+For example:
+
+If a Bella+Canvas 3001 product has Black, White, Navy, Heather Gray, and Military Green color options, every color must receive the same selected background.
+
+If each color has sizes S, M, L, XL, 2XL, and 3XL, the application should reuse the generated image for all sizes sharing the same color mockup.
+
+Do not generate unnecessary duplicate images.
+
+Maintain accurate relationships between Shopify variants and their corresponding images.
+
+**Step 6 — Preview Before Publishing**
+
+- Display a preview of every generated color mockup.
+- Show the original and processed images for comparison.
+- Indicate which variants will be affected.
+- Display warnings for missing or incompatible source images.
+- Require explicit user approval before making changes to Shopify.
+
+**Step 7 — Publish to Shopify**
+
+After approval:
+
+- Upload the newly generated mockup images to the corresponding Shopify product.
+- Associate each image with the appropriate product variants.
+- Ensure selecting a shirt color displays the correct mockup.
+- Allow the generated mockups to become the primary product images.
+- Preserve the original Printful images for recovery.
+- Do not delete the original product media automatically.
+- Do not modify Shopify product pricing, SKUs, inventory, fulfillment settings, or Printful synchronization identifiers.
+- Record publishing results and failures.
+- Provide a rollback option to restore previous image associations.
+
+Use supported Shopify Admin GraphQL API operations and verify their current availability before implementing them.
+
+### 4. Application Interface
+
+The interface should be modern, clean, professional, and easy to operate.
+
+Use a layout inspired by Shopify Admin.
+
+The main page should contain:
+
+**Section A — Product Selection**
+- Shopify product title search
+- Search results
+- Selected product details
+- Number of variants and unique garment colors
+
+**Section B — Background Selection**
+- Upload background button
+- Saved background library
+- Selected background preview
+
+**Section C — Mockup Preview**
+- Preview of each shirt color with the selected background
+- Original versus generated image comparison
+- Processing status
+- Validation warnings
+
+**Section D — Publishing**
+- Generate All Mockups button
+- Publish to Shopify button
+- Publishing progress
+- Success and error messages
+- Restore Original Images option
+
+For the initial version, avoid unnecessary features such as AI background generation, garment recoloring, design editing, or complex image manipulation.
+
+### 5. Technical Architecture
+
+Use a modular architecture with clear separation between:
+
+1. React frontend
+2. Node.js API backend
+3. Shopify API integration service
+4. Image-processing service
+5. Local background image storage
+6. SQLite database
+7. Publishing and rollback service
+
+The backend must handle all Shopify credentials and authenticated API requests.
+
+Never expose Shopify access tokens to the browser.
+
+Use environment variables for secrets and exclude `.env` files from Git.
+
+Implement proper error handling, logging, image validation, and Shopify API rate-limit handling.
+
+Avoid relying on deprecated Shopify APIs.
+
+### 6. Important Image-Processing Requirements
+
+The original Printful mockup is the source of truth.
+
+The application must not regenerate or modify the shirt using AI.
+
+The shirt must remain visually identical to the original, except for permissible whole-image positioning and proportional scaling.
+
+The compositing process must preserve transparency, avoid visible halos, and produce consistent results.
+
+A PNG file does not automatically mean that it has a transparent background.
+
+The application must inspect the actual alpha channel before processing.
+
+If the original image contains a solid background, flag it as incompatible and request a suitable transparent source.
+
+Do not automatically perform background removal in the initial version.
+
+### 7. Development Phases
+
+We will build the application incrementally using VS Code and Codex.
+
+**Phase 1 — Local Application Foundation**
+- Initialize the project.
+- Configure React, TypeScript, Node.js, and Sharp.
+- Create the application interface.
+- Implement local background upload.
+- Build a working mockup preview using sample transparent images.
+- No Shopify modifications during this phase.
+
+**Phase 2 — Shopify Read-Only Integration**
+- Configure secure Shopify API access.
+- Search products by title.
+- Retrieve product details, variants, and images.
+- Map product variants to source mockups.
+- Keep Shopify access read-only while testing.
+
+**Phase 3 — Image Processing**
+- Implement Sharp-based image compositing.
+- Apply one background to all unique shirt mockups.
+- Generate previews.
+- Validate transparency and output quality.
+- Add error handling.
+
+**Phase 4 — Shopify Publishing**
+- Implement authenticated product media uploads.
+- Associate generated media with the correct variants.
+- Add explicit publishing confirmation.
+- Preserve original media.
+- Implement rollback and publishing logs.
+
+**Phase 5 — Enhancements**
+- Saved background library.
+- Batch product processing.
+- Reusable collection-specific backgrounds.
+- Saved mockup configurations.
+- Improved progress reporting.
+- Optional future hosting.
+
+### 8. Development Instructions for ChatGPT
+
+Act as my **senior full-stack software architect, Shopify integration specialist, and technical development advisor**.
+
+I will use VS Code with Codex to implement the application.
+
+Your responsibilities are to:
+
+- Design the application architecture.
+- Provide clear, detailed implementation instructions for Codex.
+- Break development into small, manageable tasks.
+- Review implementation plans and code when provided.
+- Identify technical risks before implementation.
+- Recommend secure and maintainable solutions.
+- Help troubleshoot errors.
+- Ensure Shopify and Printful integration remain safe.
+
+Do not assume that code has been written or tested unless I confirm it.
+
+Do not move to the next development phase until we have verified the current phase.
+
+When providing Codex prompts, make them detailed enough for Codex to implement the task with minimal ambiguity.
+
+Prioritize simplicity, reliability, maintainability, and preservation of the original product images.
+
+### 9. Critical Business Requirements
+
+The following requirements must not be compromised:
+
+1. The brand name is **Equipd Wear**. Do not refer to the store as Thread & Press.
+2. The project name is **Mockup-Automation**.
+3. The application runs locally on Windows initially.
+4. Development uses **VS Code + Codex**.
+5. Product lookup is performed using the Shopify product title.
+6. Background images are supplied by me.
+7. The original shirt and its printed artwork must remain unchanged.
+8. The selected background applies to every applicable product variant.
+9. Generated images must be previewed before publishing.
+10. Shopify product images must be updated only after approval.
+11. Original images and variant associations must be recoverable.
+12. Printful fulfillment integration must remain unaffected.
+
+### 10. Where We Are Now
+
+We have completed the requirements discussion and selected the initial technology stack.
+
+No application code has been created yet.
+
+We are ready to begin **Phase 1 — Local Application Foundation**.
+
+Start by reviewing this project specification and identifying any important technical considerations or missing prerequisites.
+
+Then provide:
+
+1. The recommended project folder structure.
+2. The software prerequisites for Windows.
+3. The initial VS Code and GitHub setup.
+4. A detailed Codex prompt for implementing Phase 1.
+
+Do not attempt to implement all phases at once. We will develop and test the application incrementally.

@@ -1,0 +1,19 @@
+{
+  "name": "mockup-automation",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": ["apps/*", "packages/*"],
+  "scripts": {
+    "dev": "concurrently -n api,web -c blue,green \"npm run dev -w @mockup-automation/api\" \"npm run dev -w @mockup-automation/web\"",
+    "build": "npm run build -w @mockup-automation/shared && npm run build -w @mockup-automation/api && npm run build -w @mockup-automation/web",
+    "test": "npm run test -w @mockup-automation/api",
+    "lint": "eslint . --max-warnings 0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.1",
+    "concurrently": "^9.2.1",
+    "eslint": "^9.39.1",
+    "typescript-eslint": "^8.46.4"
+  },
+  "engines": { "node": ">=20.19.0" }
+}

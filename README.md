@@ -1,6 +1,6 @@
 # Mockup-Automation
 
-Phase 1 local Windows application for Equipd Wear. It composites an original transparent apparel PNG over a user-supplied JPEG/PNG background while preserving both source files. Shopify search and publishing are visibly disabled and are not implemented.
+Local Windows application for Equipd Wear. Phase 1 composites an original transparent apparel PNG over a user-supplied JPEG/PNG background while preserving both source files. Phase 2 adds optional, read-only Shopify product lookup and source-image import. Shopify publishing remains disabled and is not implemented.
 
 ## Prerequisites
 
@@ -21,7 +21,7 @@ Copy-Item .env.example .env
 npm run dev
 ```
 
-Open <http://localhost:3000>. The API listens on <http://localhost:3001>. The environment file is optional because local defaults are built in.
+Open <http://127.0.0.1:3000>. The API listens on <http://127.0.0.1:3001>. During local development, Vite proxies same-origin `/api` requests to the API, avoiding browser CORS and `localhost` IPv4/IPv6 resolution differences. The environment file is optional because local defaults are built in. For separate-origin production hosting only, set `VITE_API_URL` to the deployed API origin.
 
 ```powershell
 npm test
@@ -34,17 +34,37 @@ These commands are root scripts backed by npm workspaces. `npm test` runs API im
 ## Local workflow
 
 1. Upload a JPEG or PNG background (maximum 12 MB by default).
-2. Upload an original transparent garment PNG. The server verifies actual alpha pixel values; a `.png` suffix alone is not enough.
+2. Upload an original transparent garment PNG. The server verifies a meaningful number of actual alpha pixel values; a `.png` suffix or a few stray transparent edge pixels is not enough. Partially transparent antialiased pixels count as transparency.
 3. Select **Generate Preview** and compare the original garment to the generated PNG.
+
+## Optional Shopify read-only setup
+
+Create and install an app through Shopify's Dev Dashboard, release a configuration with only the `read_products` Admin API scope, and confirm the app and Equipd Wear store are in the same Shopify organization. Client credentials are not eligible for stores outside the app's organization.
+
+Copy `.env.example` to the repository-root `.env` and set:
+
+```text
+SHOPIFY_SHOP_DOMAIN=your-store.myshopify.com
+SHOPIFY_CLIENT_ID=...
+SHOPIFY_CLIENT_SECRET=...
+SHOPIFY_API_VERSION=2026-10
+```
+
+Restart `npm run dev`. The backend exchanges these credentials for a short-lived token, caches it only in memory, refreshes it shortly before expiry, and checks for `read_products`. Credentials and tokens never enter browser responses or application logs. If the variables are absent, manual Phase 1 operation continues unchanged.
+
+Product image-to-color mappings are considered reliable only when Shopify exposes a direct variant image or media association. Shared and unassociated images are marked for manual review. A Shopify image must pass the same decoded-format and meaningful-alpha validation as a manual garment before it can be used for preview generation.
 
 Local source assets are stored beneath ignored `data/uploads/`; generated previews are stored beneath ignored `data/generated/`. Files receive generated UUID names. To change limits or ports, copy `.env.example` to `.env` and edit local values.
 
 ## Safety and current limitations
 
-- No Shopify credentials, API calls, publishing, Printful sync, AI generation, background removal, garment recoloring, or batch processing.
-- Product search and publishing controls are future-phase placeholders and disabled.
+- No Shopify writes, publishing, deletion, replacement, Printful sync, AI generation, background removal, garment recoloring, or batch processing.
+- Product search is read-only and enabled only after successful authentication and scope verification. Publishing controls remain disabled.
 - Metadata is local JSON beside the assets. SQLite remains reserved for a later phase when durable relational metadata is needed.
+- EXIF orientation is normalized before background dimensions are chosen, so rotated portrait JPEGs produce portrait previews without stretching.
 - The garment is centered and proportionally downscaled only if necessary to fit. It is never cropped or nonuniformly scaled.
-- Uploaded files are available through ID-validated API routes, not a public source directory.
+- Uploaded files are available through strict RFC-compatible UUID-validated API routes, not a public source directory.
+- A failed replacement upload retains the previously validated selection and preview and labels that state explicitly.
+- Current dependency-audit findings and deferred breaking remediations are recorded in [docs/SECURITY.md](docs/SECURITY.md).
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the service boundary and image guarantees.

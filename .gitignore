@@ -8,8 +8,8 @@ dist/
 *.db-wal
 *.sqlite
 *.sqlite3
-data/uploads/**
-data/generated/**
+**/data/uploads/**
+**/data/generated/**
 !data/uploads/.gitkeep
 !data/generated/.gitkeep
 *.log

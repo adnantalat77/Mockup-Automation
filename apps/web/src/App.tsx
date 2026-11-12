@@ -1,7 +1,9 @@
-import { useMemo, useState } from 'react';
-import type { ApiError, ImageAsset } from '@mockup-automation/shared';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import type { ApiError, ImageAsset, ShopifyProductDetail, ShopifyProductSummary, ShopifyStatus } from '@mockup-automation/shared';
 
-const apiBase = import.meta.env.VITE_API_URL ?? 'http://localhost:3001';
+// Development stays same-origin through Vite's /api proxy. A production host
+// can provide VITE_API_URL when the deployed API has a separate origin.
+const apiBase = import.meta.env.PROD ? (import.meta.env.VITE_API_URL ?? '').replace(/\/$/, '') : '';
 
 async function upload(path: string, file: File): Promise<ImageAsset> {
   const body = new FormData(); body.append('image', file);
@@ -13,21 +15,94 @@ async function upload(path: string, file: File): Promise<ImageAsset> {
 
 function assetUrl(asset?: ImageAsset) { return asset ? `${apiBase}${asset.url}` : ''; }
 
+async function apiJson<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(`${apiBase}${path}`, init);
+  const result = await response.json() as T | ApiError;
+  if (!response.ok) throw new Error((result as ApiError).error);
+  return result as T;
+}
+
 function UploadCard({ title, hint, accept, endpoint, asset, onAsset }: { title: string; hint: string; accept: string; endpoint: string; asset?: ImageAsset; onAsset: (asset: ImageAsset) => void }) {
   const [status, setStatus] = useState('');
   const [error, setError] = useState('');
+  const [uploading, setUploading] = useState(false);
+  const requestNumber = useRef(0);
   async function choose(file?: File) {
     if (!file) return;
+    const currentRequest = ++requestNumber.current;
+    setUploading(true);
     setStatus('Uploading and validating…'); setError('');
-    try { onAsset(await upload(endpoint, file)); setStatus('Ready'); }
-    catch (cause) { setStatus(''); setError(cause instanceof Error ? cause.message : 'Upload failed.'); }
+    try {
+      const uploaded = await upload(endpoint, file);
+      if (currentRequest !== requestNumber.current) return;
+      onAsset(uploaded); setStatus('Ready');
+    } catch (cause) {
+      if (currentRequest !== requestNumber.current) return;
+      setStatus(asset ? `Current selection retained: ${asset.originalName}` : 'No image selected');
+      setError(`Upload failed. ${cause instanceof Error ? cause.message : 'The file could not be uploaded.'}`);
+    } finally {
+      if (currentRequest === requestNumber.current) setUploading(false);
+    }
   }
   return <div className="upload-card">
     <div><h3>{title}</h3><p>{hint}</p></div>
-    <label className="upload-button"><input type="file" accept={accept} onChange={(event) => void choose(event.target.files?.[0])}/>{asset ? 'Replace image' : 'Choose file'}</label>
+    <label className="upload-button"><input type="file" accept={accept} disabled={uploading} onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ''; void choose(file); }}/>{uploading ? 'Validating…' : asset ? 'Replace image' : 'Choose file'}</label>
     {status && <span className="status">● {status}</span>}{error && <div className="error" role="alert">{error}</div>}
     {asset && <div className="asset-meta"><strong>{asset.originalName}</strong><span>{asset.width} × {asset.height}px</span></div>}
   </div>;
+}
+
+function ShopifyProductPanel({ onGarment }: { onGarment: (asset: ImageAsset) => void }) {
+  const [status, setStatus] = useState<ShopifyStatus>({ configured: false, connected: false, scopes: [] });
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState<ShopifyProductSummary[]>([]);
+  const [product, setProduct] = useState<ShopifyProductDetail>();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    void apiJson<ShopifyStatus>('/api/shopify/status')
+      .then(setStatus)
+      .catch((cause) => setStatus({ configured: true, connected: false, scopes: [], error: cause instanceof Error ? cause.message : 'Shopify connectivity failed.' }));
+  }, []);
+
+  async function search() {
+    setBusy(true); setError(''); setProduct(undefined);
+    try { setResults(await apiJson<ShopifyProductSummary[]>(`/api/shopify/products?title=${encodeURIComponent(query)}`)); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : 'Product search failed.'); }
+    finally { setBusy(false); }
+  }
+
+  async function select(id: string) {
+    setBusy(true); setError('');
+    try { setProduct(await apiJson<ShopifyProductDetail>(`/api/shopify/product?id=${encodeURIComponent(id)}`)); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : 'Product details could not be loaded.'); }
+    finally { setBusy(false); }
+  }
+
+  async function useImage(imageId: string) {
+    if (!product) return;
+    setBusy(true); setError('');
+    try {
+      const asset = await apiJson<ImageAsset>('/api/shopify/images/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ productId: product.id, imageId }) });
+      onGarment(asset);
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Shopify image import failed.'); }
+    finally { setBusy(false); }
+  }
+
+  const label = status.connected ? `Connected · ${status.shop}` : status.configured ? 'Connection unavailable' : 'Not configured';
+  return <section className={`panel ${status.connected ? '' : 'disabled'}`}>
+    <div className="section-number">01</div>
+    <div className="section-heading"><div><h2>Product Selection</h2><p>Read-only Shopify catalog lookup. No product data can be changed.</p></div><span className={status.connected ? 'local' : 'future'}>{label}</span></div>
+    {!status.connected && <div className="notice">{status.error ?? 'Add optional Shopify server credentials to enable Phase 2 search. Manual garment upload remains available below.'}</div>}
+    <form className="search-row" onSubmit={(event) => { event.preventDefault(); void search(); }}><input value={query} onChange={(event) => setQuery(event.target.value)} disabled={!status.connected || busy} placeholder="Exact Shopify product title"/><button disabled={!status.connected || busy || query.trim().length < 2}>{busy ? 'Loading…' : 'Search Shopify'}</button></form>
+    {error && <div className="error" role="alert">{error}</div>}
+    {results.length > 0 && <div className="product-results">{results.map((result) => <button type="button" className="product-result" key={result.id} onClick={() => void select(result.id)} disabled={busy}>{result.imageUrl ? <img src={result.imageUrl} alt=""/> : <span className="result-placeholder">◇</span>}<span><strong>{result.title}</strong><small>{result.status} · {result.handle}</small></span></button>)}</div>}
+    {product && <div className="product-detail"><div className="product-summary"><div><span className="eyebrow">SELECTED PRODUCT</span><h3>{product.title}</h3></div><div><strong>{product.colors.length}</strong><small> colors</small> · <strong>{product.variants.length}</strong><small> variants</small></div></div>
+      <div className="chips">{product.colors.map((color) => <span key={color}>{color}</span>)}{product.colors.length === 0 && <span>Color option not identified</span>}</div>
+      <h4>Product images</h4><div className="shopify-images">{product.images.map((image) => <article key={image.id} className="shopify-image"><div className="shopify-image-frame"><img src={image.url} alt={image.altText ?? 'Shopify product image'}/></div><div><span className={`validation ${image.validation}`}>{image.validation}</span><p>{image.association === 'reliable' ? `Associated: ${image.associatedColors.join(', ')}` : image.association === 'ambiguous' ? 'Manual review: shared across colors' : 'Manual review: no reliable color association'}</p><button type="button" disabled={busy || image.validation !== 'transparent'} onClick={() => void useImage(image.id)}>Use transparent source</button></div></article>)}</div>
+    </div>}
+  </section>;
 }
 
 export function App() {
@@ -52,11 +127,11 @@ export function App() {
   }
 
   return <div className="shell">
-    <header><div className="brand-mark">EW</div><div><p className="eyebrow">EQUIPD WEAR</p><h1>Mockup Automation</h1></div><span className="phase">Phase 1 · Local</span></header>
+    <header><div className="brand-mark">EW</div><div><p className="eyebrow">EQUIPD WEAR</p><h1>Mockup Automation</h1></div><span className="phase">Phase 2 · Read only</span></header>
     <main>
       <section className="hero"><div><p className="eyebrow">COMPOSITE WORKSPACE</p><h2>Build listing-ready previews without changing the garment.</h2><p>Layer an original transparent apparel PNG over your own background. Every source stays untouched.</p></div><div className="guardrail"><span>✦</span><div><strong>Pixel-preservation rule</strong><p>No AI edits, recoloring, background removal, cropping, or distortion.</p></div></div></section>
-      <section className="panel disabled"><div className="section-number">01</div><div className="section-heading"><div><h2>Product Selection</h2><p>Connect and search the Equipd Wear catalog in Phase 2.</p></div><span className="future">Future phase</span></div><div className="search-row"><input disabled placeholder="Shopify product title"/><button disabled>Search Shopify</button></div></section>
-      <section className="panel"><div className="section-number">02</div><div className="section-heading"><div><h2>Background Selection</h2><p>Upload one local scene plus an original transparent garment source.</p></div><span className="local">Local files</span></div><div className="upload-grid"><UploadCard title="Background image" hint="JPEG or PNG · up to 12 MB" accept="image/jpeg,image/png" endpoint="/api/backgrounds" asset={background} onAsset={(value) => { setBackground(value); setPreview(undefined); }}/><UploadCard title="Transparent garment" hint="PNG · transparency is verified pixel-by-pixel" accept="image/png" endpoint="/api/garments" asset={garment} onAsset={(value) => { setGarment(value); setPreview(undefined); }}/></div></section>
+      <ShopifyProductPanel onGarment={(value) => { setGarment(value); setPreview(undefined); setMessage('Shopify source imported locally. The remote original was not changed.'); }}/>
+      <section className="panel"><div className="section-number">02</div><div className="section-heading"><div><h2>Background Selection</h2><p>Upload one local scene. Manual garment upload remains available as Phase 1 test mode.</p></div><span className="local">Local files</span></div><div className="upload-grid"><UploadCard title="Background image" hint="JPEG or PNG · up to 12 MB" accept="image/jpeg,image/png" endpoint="/api/backgrounds" asset={background} onAsset={(value) => { setBackground(value); setPreview(undefined); }}/><UploadCard title="Manual garment test mode" hint="PNG · transparency is verified pixel-by-pixel" accept="image/png" endpoint="/api/garments" asset={garment} onAsset={(value) => { setGarment(value); setPreview(undefined); }}/></div></section>
       <section className="panel"><div className="section-number">03</div><div className="section-heading"><div><h2>Mockup Preview</h2><p>Compare the unchanged source with the generated composite.</p></div><button className="primary" disabled={!ready || generating} onClick={() => void generate()}>{generating ? 'Generating…' : 'Generate Preview'}</button></div><div className="preview-grid"><Preview title="Original garment" src={assetUrl(garment)} empty="Upload a transparent garment PNG" checker/><Preview title="Generated preview" src={generatedUrl} empty={ready ? 'Select Generate Preview' : 'Add both source images'}/></div>{message && <div className={preview ? 'success' : 'error'} role="status">{message}</div>}</section>
       <section className="panel disabled"><div className="section-number">04</div><div className="section-heading"><div><h2>Publishing</h2><p>Shopify writes, variant association, and rollback arrive only after later-phase approval and testing.</p></div><span className="future">Unavailable in Phase 1</span></div><div className="publish-row"><button disabled>Publish to Shopify</button><button disabled>Restore original images</button></div></section>
     </main><footer>Local processing only · Equipd Wear · Source files remain unchanged</footer>

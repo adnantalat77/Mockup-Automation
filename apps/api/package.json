@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "build": "tsc -p tsconfig.json",
-    "test": "vitest run --coverage",
+    "test": "vitest run src --coverage",
     "test:watch": "vitest"
   },
   "dependencies": {

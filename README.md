@@ -1,6 +1,6 @@
 # Mockup-Automation
 
-Local Windows application for Equipd Wear. Phase 1 composites an original transparent apparel PNG over a user-supplied JPEG/PNG background while preserving both source files. Phase 2 adds optional, read-only Shopify product lookup and source-image import. Shopify publishing remains disabled and is not implemented.
+Local Windows application for Equipd Wear. Phase 1 composites an original transparent apparel PNG over a user-supplied JPEG/PNG background. Phase 2 adds optional read-only Shopify catalog access. Phase 3 generates and reviews one local preview per reliably mapped garment color. Shopify publishing remains disabled.
 
 ## Prerequisites
 
@@ -54,11 +54,17 @@ Restart `npm run dev`. The backend exchanges these credentials for a short-lived
 
 Product image-to-color mappings are considered reliable only when Shopify exposes a direct variant image or media association. Shared and unassociated images are marked for manual review. A Shopify image must pass the same decoded-format and meaningful-alpha validation as a manual garment before it can be used for preview generation.
 
+## Bulk mockup generation
+
+After selecting a Shopify product and uploading one background, choose **Generate All Mockups**. The backend paginates product images, media, and variants, then creates one job per Shopify color. A color is generated only when exactly one transparent PNG has a direct variant/media association. Missing sources and conflicts are skipped with a manual-review explanation; filenames and alt text are never used to guess.
+
+At most two colors are processed concurrently, a batch is limited to 50 colors, transient Shopify failures receive one retry, and cancellation stops queued work while allowing an in-flight image write to finish safely. Progress and per-color results are persisted under ignored local `data/batches/` metadata, and the dashboard restores the most recently updated batch. Interrupted jobs are marked for regeneration when the API restarts. Completed colors can be regenerated individually or downloaded together as an uncompressed ZIP archive. ZIP creation is limited to 150 MB of source preview data.
+
 Local source assets are stored beneath ignored `data/uploads/`; generated previews are stored beneath ignored `data/generated/`. Files receive generated UUID names. To change limits or ports, copy `.env.example` to `.env` and edit local values.
 
 ## Safety and current limitations
 
-- No Shopify writes, publishing, deletion, replacement, Printful sync, AI generation, background removal, garment recoloring, or batch processing.
+- No Shopify writes, publishing, deletion, replacement, Printful sync, AI generation, background removal, or garment recoloring.
 - Product search is read-only and enabled only after successful authentication and scope verification. Publishing controls remain disabled.
 - Metadata is local JSON beside the assets. SQLite remains reserved for a later phase when durable relational metadata is needed.
 - EXIF orientation is normalized before background dimensions are chosen, so rotated portrait JPEGs produce portrait previews without stretching.

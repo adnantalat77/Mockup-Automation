@@ -10,6 +10,7 @@ dist/
 *.sqlite3
 **/data/uploads/**
 **/data/generated/**
+**/data/batches/**
 !data/uploads/.gitkeep
 !data/generated/.gitkeep
 *.log

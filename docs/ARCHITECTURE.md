@@ -20,6 +20,16 @@ Color mappings use only direct Shopify variant image or media associations. An i
 
 When Shopify variables are absent or incomplete, the status route reports the integration unavailable and all Phase 1 local upload and compositing functionality remains operational.
 
+## Phase 3 batch processing
+
+Shopify product detail connections are cursor-paginated with a 20-page safety cap. Unique images are decoded and alpha-validated sequentially, with at most 250 relevant images retained. Batch creation accepts only a validated product GID and an existing local background UUID. It caps work at 50 colors and two active batches.
+
+`BatchService` derives candidates exclusively from reliable Shopify variant/media associations. Exactly one compatible transparent candidate is queued; missing and conflicting mappings are persisted as manual-review skips. Two workers process colors concurrently. Each worker downloads and revalidates its source, reads the preserved background, calls the existing `compositePreview`, and writes a new preview without changing either source. Transient Shopify failures receive one retry.
+
+Batch JSON metadata is stored under ignored `data/batches/` and serialized per batch to prevent concurrent write races. On startup, interrupted queued or processing items become failed review items rather than being resumed silently. Cancellation sets a durable flag, prevents new items from starting, and lets in-flight processing complete safely. Individual successful mappings can be regenerated after the batch stops.
+
+ZIP export includes only successful previews, uses unique sanitized color filenames, performs no image transformation, and rejects archives whose input previews exceed 150 MB. The archive is assembled in memory, so this limit is a deliberate local safety bound.
+
 ## Image guarantees
 
 The API decodes files with Sharp instead of trusting extensions or browser MIME types. Garment PNGs are converted to raw RGBA for alpha-pixel inspection. Validation requires at least 16 meaningful alpha pixels or 0.1% of the image, whichever is greater (bounded by total pixels), using alpha values at or below 250. This rejects opaque files and isolated near-opaque edge artifacts while retaining legitimate partially transparent antialiasing.

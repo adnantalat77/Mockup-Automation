@@ -52,6 +52,19 @@ describe('ShopifyService', () => {
     expect(detail.images[0]).toMatchObject({ association: 'reliable', associatedColors: ['Black'] });
   });
 
+  it('paginates product images, media, and variants', async () => {
+    const connection = (nodes: unknown[], hasNextPage: boolean, endCursor: string | null) => ({ nodes, pageInfo: { hasNextPage, endCursor } });
+    const variant = (id: number, color: string) => ({ id: `gid://shopify/ProductVariant/${id}`, title: `${color} / M`, selectedOptions: [{ name: 'Color', value: color }], image: null, media: { nodes: [] } });
+    const page = (variants: unknown[], hasNextPage: boolean, cursor: string | null) => ({ data: { product: { id: 'gid://shopify/Product/123', title: 'Shirt', handle: 'shirt', status: 'ACTIVE', images: connection([], false, null), media: connection([], false, null), variants: connection(variants, hasNextPage, cursor) } } });
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(json({ access_token: 'token', expires_in: 3600 }))
+      .mockResolvedValueOnce(json(page([variant(1, 'Black')], true, 'next')))
+      .mockResolvedValueOnce(json(page([variant(2, 'Navy')], false, null)));
+    const detail = await new ShopifyService(config, fetcher as unknown as typeof fetch).getProduct('gid://shopify/Product/123', false);
+    expect(detail.variants.map((item) => item.color)).toEqual(['Black', 'Navy']);
+    expect(JSON.parse(fetcher.mock.calls[2][1].body).variables.variantAfter).toBe('next');
+  });
+
   it('refreshes an expired token once after a 401', async () => {
     const fetcher = vi.fn()
       .mockResolvedValueOnce(json({ access_token: 'old', expires_in: 3600 }))

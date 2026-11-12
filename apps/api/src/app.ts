@@ -8,6 +8,7 @@ import { AssetStore } from './services/storage.js';
 import { analyzeTransparency, compositePreview, ImageValidationError, inspectImage } from './services/images.js';
 import { loadConfig, type AppConfig } from './config.js';
 import { ShopifyError, ShopifyService } from './services/shopify.js';
+import { BatchError, BatchService } from './services/batches.js';
 
 export async function createApp(overrides: Partial<AppConfig> = {}) {
   const config = loadConfig(overrides);
@@ -19,6 +20,8 @@ export async function createApp(overrides: Partial<AppConfig> = {}) {
     try { shopify = new ShopifyService(config.shopify, fetch, config.maxUploadBytes); }
     catch (error) { shopifySetupError = error instanceof Error ? error.message : 'Shopify configuration is invalid.'; }
   }
+  const batches = shopify ? new BatchService(config.dataDir, store, shopify) : undefined;
+  if (batches) await batches.init();
   const app = express();
   app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
   app.use(cors({ origin: config.webOrigin }));
@@ -55,6 +58,51 @@ export async function createApp(overrides: Partial<AppConfig> = {}) {
         originalName: imported.originalName, width: imported.info.width, height: imported.info.height, hasTransparency: true
       });
       response.status(201).json(asset);
+    } catch (error) { next(error); }
+  });
+
+  app.post('/api/batches', async (request, response, next) => {
+    try {
+      if (!batches) throw new ShopifyError('Shopify is not configured.', 503, 'NOT_CONFIGURED');
+      response.status(202).json(await batches.create(String(request.body?.productId ?? ''), String(request.body?.backgroundId ?? '')));
+    } catch (error) { next(error); }
+  });
+
+  app.get('/api/batches', (_request, response, next) => {
+    try {
+      if (!batches) throw new ShopifyError('Shopify is not configured.', 503, 'NOT_CONFIGURED');
+      response.json(batches.list());
+    } catch (error) { next(error); }
+  });
+
+  app.get('/api/batches/:id', async (request, response, next) => {
+    try {
+      if (!batches) throw new ShopifyError('Shopify is not configured.', 503, 'NOT_CONFIGURED');
+      response.json(await batches.get(request.params.id));
+    } catch (error) { next(error); }
+  });
+
+  app.post('/api/batches/:id/cancel', async (request, response, next) => {
+    try {
+      if (!batches) throw new ShopifyError('Shopify is not configured.', 503, 'NOT_CONFIGURED');
+      response.json(await batches.cancel(request.params.id));
+    } catch (error) { next(error); }
+  });
+
+  app.post('/api/batches/:id/regenerate', async (request, response, next) => {
+    try {
+      if (!batches) throw new ShopifyError('Shopify is not configured.', 503, 'NOT_CONFIGURED');
+      response.status(202).json(await batches.regenerate(request.params.id, String(request.body?.color ?? '')));
+    } catch (error) { next(error); }
+  });
+
+  app.get('/api/batches/:id/download', async (request, response, next) => {
+    try {
+      if (!batches) throw new ShopifyError('Shopify is not configured.', 503, 'NOT_CONFIGURED');
+      const archive = await batches.zip(request.params.id);
+      response.setHeader('Content-Type', 'application/zip');
+      response.setHeader('Content-Disposition', `attachment; filename="mockups-${request.params.id}.zip"`);
+      response.send(archive);
     } catch (error) { next(error); }
   });
 
@@ -109,6 +157,7 @@ export async function createApp(overrides: Partial<AppConfig> = {}) {
     void _next;
     if (error instanceof multer.MulterError && error.code === 'LIMIT_FILE_SIZE') return response.status(413).json({ error: `Image exceeds the ${Math.round(config.maxUploadBytes / 1024 / 1024)} MB limit.` });
     if (error instanceof ShopifyError) return response.status(error.status).json({ error: error.message });
+    if (error instanceof BatchError) return response.status(error.status).json({ error: error.message });
     const clientError = error instanceof ImageValidationError || error?.message === 'Asset not found.';
     response.status(clientError ? 400 : 500).json({ error: clientError ? error.message : 'The request could not be completed.' });
   });

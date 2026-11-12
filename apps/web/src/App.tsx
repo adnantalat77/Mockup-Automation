@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { ApiError, ImageAsset, ShopifyProductDetail, ShopifyProductSummary, ShopifyStatus } from '@mockup-automation/shared';
+import type { ApiError, ImageAsset, MockupBatch, ShopifyProductDetail, ShopifyProductSummary, ShopifyStatus } from '@mockup-automation/shared';
 
 // Development stays same-origin through Vite's /api proxy. A production host
 // can provide VITE_API_URL when the deployed API has a separate origin.
@@ -52,7 +52,7 @@ function UploadCard({ title, hint, accept, endpoint, asset, onAsset }: { title: 
   </div>;
 }
 
-function ShopifyProductPanel({ onGarment }: { onGarment: (asset: ImageAsset) => void }) {
+function ShopifyProductPanel({ onGarment, onProduct }: { onGarment: (asset: ImageAsset) => void; onProduct: (product: ShopifyProductDetail) => void }) {
   const [status, setStatus] = useState<ShopifyStatus>({ configured: false, connected: false, scopes: [] });
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<ShopifyProductSummary[]>([]);
@@ -75,7 +75,7 @@ function ShopifyProductPanel({ onGarment }: { onGarment: (asset: ImageAsset) => 
 
   async function select(id: string) {
     setBusy(true); setError('');
-    try { setProduct(await apiJson<ShopifyProductDetail>(`/api/shopify/product?id=${encodeURIComponent(id)}`)); }
+    try { const selected = await apiJson<ShopifyProductDetail>(`/api/shopify/product?id=${encodeURIComponent(id)}`); setProduct(selected); onProduct(selected); }
     catch (cause) { setError(cause instanceof Error ? cause.message : 'Product details could not be loaded.'); }
     finally { setBusy(false); }
   }
@@ -105,10 +105,49 @@ function ShopifyProductPanel({ onGarment }: { onGarment: (asset: ImageAsset) => 
   </section>;
 }
 
+function BatchPanel({ product, background }: { product?: ShopifyProductDetail; background?: ImageAsset }) {
+  const [batch, setBatch] = useState<MockupBatch>();
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    void apiJson<MockupBatch[]>('/api/batches').then((saved) => { if (saved[0]) setBatch(saved[0]); }).catch(() => { /* Shopify can be intentionally unconfigured. */ });
+  }, []);
+
+  useEffect(() => {
+    if (!batch || batch.status !== 'running') return;
+    const timer = window.setInterval(() => {
+      void apiJson<MockupBatch>(`/api/batches/${batch.id}`).then(setBatch).catch((cause) => setError(cause instanceof Error ? cause.message : 'Batch status failed.'));
+    }, 750);
+    return () => window.clearInterval(timer);
+  }, [batch?.id, batch?.status]);
+
+  async function createBatch() {
+    if (!product || !background) return;
+    setBusy(true); setError('');
+    try { setBatch(await apiJson<MockupBatch>('/api/batches', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ productId: product.id, backgroundId: background.id }) })); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : 'Batch generation could not start.'); }
+    finally { setBusy(false); }
+  }
+
+  async function cancel() { if (batch) setBatch(await apiJson<MockupBatch>(`/api/batches/${batch.id}/cancel`, { method: 'POST' })); }
+  async function regenerate(color: string) { if (batch) setBatch(await apiJson<MockupBatch>(`/api/batches/${batch.id}/regenerate`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ color }) })); }
+
+  return <section className="panel"><div className="section-number">04</div><div className="section-heading"><div><h2>Bulk Mockup Generation</h2><p>Generate one preview for every color with exactly one reliable transparent source.</p></div><button className="primary" disabled={!product || !background || busy || batch?.status === 'running'} onClick={() => void createBatch()}>{busy ? 'Preparing…' : 'Generate All Mockups'}</button></div>
+    {!product || !background ? <div className="notice">Select a Shopify product and upload a background to enable batch generation.</div> : null}
+    {error && <div className="error">{error}</div>}
+    {batch && <div className="batch-workspace"><div className="batch-status"><strong>{batch.status}</strong><span>{batch.counts.success} succeeded</span><span>{batch.counts.failed} failed</span><span>{batch.counts.skipped} skipped</span><span>{batch.counts.processing + batch.counts.queued} remaining</span>{batch.status === 'running' && <button onClick={() => void cancel()}>Cancel safely</button>}{batch.counts.success > 0 && <a className="download-button" href={`${apiBase}/api/batches/${batch.id}/download`}>Download ZIP</a>}</div>
+      <div className="batch-progress"><span style={{ width: `${batch.counts.total ? ((batch.counts.success + batch.counts.failed + batch.counts.skipped + batch.counts.cancelled) / batch.counts.total) * 100 : 0}%` }}/></div>
+      <div className="batch-gallery">{batch.items.map((item) => <article className="batch-card" key={item.color}><div className="batch-image">{item.preview ? <img src={assetUrl(item.preview)} alt={`${item.color} generated mockup`}/> : <span aria-hidden="true">◇</span>}</div><div><h3>{item.color}</h3><span className={`validation ${item.status === 'success' ? 'transparent' : item.status === 'skipped' ? 'opaque' : 'unavailable'}`}>{item.status}</span>{item.reason && <p>{item.reason}</p>}{item.sourceImageId && batch.status !== 'running' && <button onClick={() => void regenerate(item.color)}>Regenerate</button>}</div></article>)}</div>
+    </div>}
+  </section>;
+}
+
 export function App() {
   const [background, setBackground] = useState<ImageAsset>();
   const [garment, setGarment] = useState<ImageAsset>();
   const [preview, setPreview] = useState<ImageAsset>();
+  const [selectedProduct, setSelectedProduct] = useState<ShopifyProductDetail>();
   const [message, setMessage] = useState('');
   const [generating, setGenerating] = useState(false);
   const ready = Boolean(background && garment);
@@ -127,13 +166,14 @@ export function App() {
   }
 
   return <div className="shell">
-    <header><div className="brand-mark">EW</div><div><p className="eyebrow">EQUIPD WEAR</p><h1>Mockup Automation</h1></div><span className="phase">Phase 2 · Read only</span></header>
+    <header><div className="brand-mark">EW</div><div><p className="eyebrow">EQUIPD WEAR</p><h1>Mockup Automation</h1></div><span className="phase">Phase 3 · Batch preview</span></header>
     <main>
       <section className="hero"><div><p className="eyebrow">COMPOSITE WORKSPACE</p><h2>Build listing-ready previews without changing the garment.</h2><p>Layer an original transparent apparel PNG over your own background. Every source stays untouched.</p></div><div className="guardrail"><span>✦</span><div><strong>Pixel-preservation rule</strong><p>No AI edits, recoloring, background removal, cropping, or distortion.</p></div></div></section>
-      <ShopifyProductPanel onGarment={(value) => { setGarment(value); setPreview(undefined); setMessage('Shopify source imported locally. The remote original was not changed.'); }}/>
+      <ShopifyProductPanel onProduct={setSelectedProduct} onGarment={(value) => { setGarment(value); setPreview(undefined); setMessage('Shopify source imported locally. The remote original was not changed.'); }}/>
       <section className="panel"><div className="section-number">02</div><div className="section-heading"><div><h2>Background Selection</h2><p>Upload one local scene. Manual garment upload remains available as Phase 1 test mode.</p></div><span className="local">Local files</span></div><div className="upload-grid"><UploadCard title="Background image" hint="JPEG or PNG · up to 12 MB" accept="image/jpeg,image/png" endpoint="/api/backgrounds" asset={background} onAsset={(value) => { setBackground(value); setPreview(undefined); }}/><UploadCard title="Manual garment test mode" hint="PNG · transparency is verified pixel-by-pixel" accept="image/png" endpoint="/api/garments" asset={garment} onAsset={(value) => { setGarment(value); setPreview(undefined); }}/></div></section>
       <section className="panel"><div className="section-number">03</div><div className="section-heading"><div><h2>Mockup Preview</h2><p>Compare the unchanged source with the generated composite.</p></div><button className="primary" disabled={!ready || generating} onClick={() => void generate()}>{generating ? 'Generating…' : 'Generate Preview'}</button></div><div className="preview-grid"><Preview title="Original garment" src={assetUrl(garment)} empty="Upload a transparent garment PNG" checker/><Preview title="Generated preview" src={generatedUrl} empty={ready ? 'Select Generate Preview' : 'Add both source images'}/></div>{message && <div className={preview ? 'success' : 'error'} role="status">{message}</div>}</section>
-      <section className="panel disabled"><div className="section-number">04</div><div className="section-heading"><div><h2>Publishing</h2><p>Shopify writes, variant association, and rollback arrive only after later-phase approval and testing.</p></div><span className="future">Unavailable in Phase 1</span></div><div className="publish-row"><button disabled>Publish to Shopify</button><button disabled>Restore original images</button></div></section>
+      <BatchPanel product={selectedProduct} background={background}/>
+      <section className="panel disabled"><div className="section-number">05</div><div className="section-heading"><div><h2>Publishing</h2><p>Shopify writes, variant association, and rollback remain unavailable.</p></div><span className="future">Disabled</span></div><div className="publish-row"><button disabled>Publish to Shopify</button><button disabled>Restore original images</button></div></section>
     </main><footer>Local processing only · Equipd Wear · Source files remain unchanged</footer>
   </div>;
 }

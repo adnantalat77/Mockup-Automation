@@ -13,7 +13,7 @@ const PRODUCT_GID = /^gid:\/\/shopify\/Product\/[1-9]\d*$/;
 const IMAGE_GID = /^gid:\/\/shopify\/(?:ProductImage|MediaImage)\/[1-9]\d*$/;
 const SHOP_DOMAIN = /^[a-z0-9][a-z0-9-]*\.myshopify\.com$/i;
 const MAX_SEARCH_RESULTS = 20;
-const MAX_PRODUCT_IMAGES = 50;
+const MAX_PRODUCT_IMAGES = 250;
 const TOKEN_MARGIN_MS = 5 * 60 * 1000;
 
 export class ShopifyError extends Error {
@@ -63,24 +63,49 @@ export class ShopifyService {
 
   async getProduct(productId: string, validateImages = true): Promise<ShopifyProductDetail> {
     this.assertProductId(productId);
-    const data = await this.graphql<{ product: any | null }>(`
-      query ProductDetail($id: ID!) {
+    let imageCursor: string | null = null;
+    let mediaCursor: string | null = null;
+    let variantCursor: string | null = null;
+    let product: any | null = null;
+    const imageNodes: ImageNode[] = [];
+    const mediaNodes: MediaNode[] = [];
+    const variantNodes: any[] = [];
+    for (let page = 0; page < 20; page += 1) {
+      const data: { product: any | null } = await this.graphql<{ product: any | null }>(`
+      query ProductDetail($id: ID!, $imageAfter: String, $mediaAfter: String, $variantAfter: String) {
         product(id: $id) {
           id title handle status
-          images(first: 100) { nodes { id url altText width height } }
-          media(first: 100) { nodes { id mediaContentType preview { image { id url altText width height } } ... on MediaImage { image { id url altText width height } } } }
-          variants(first: 250) {
+          images(first: 100, after: $imageAfter) { nodes { id url altText width height } pageInfo { hasNextPage endCursor } }
+          media(first: 100, after: $mediaAfter) { nodes { id mediaContentType preview { image { id url altText width height } } ... on MediaImage { image { id url altText width height } } } pageInfo { hasNextPage endCursor } }
+          variants(first: 100, after: $variantAfter) {
             nodes {
               id title selectedOptions { name value }
               image { id url altText width height }
-              media(first: 20) { nodes { id mediaContentType preview { image { id url altText width height } } ... on MediaImage { image { id url altText width height } } } }
+              media(first: 100) { nodes { id mediaContentType preview { image { id url altText width height } } ... on MediaImage { image { id url altText width height } } } }
             }
+            pageInfo { hasNextPage endCursor }
           }
         }
       }
-    `, { id: productId });
-    if (!data.product) throw new ShopifyError('Shopify product not found.', 404, 'NOT_FOUND');
-    const product = data.product;
+    `, { id: productId, imageAfter: imageCursor, mediaAfter: mediaCursor, variantAfter: variantCursor });
+      if (!data.product) throw new ShopifyError('Shopify product not found.', 404, 'NOT_FOUND');
+      product ??= data.product;
+      imageNodes.push(...data.product.images.nodes);
+      mediaNodes.push(...data.product.media.nodes);
+      variantNodes.push(...data.product.variants.nodes);
+      const imagePage: { hasNextPage?: boolean; endCursor?: string | null } | undefined = data.product.images.pageInfo;
+      const mediaPage: { hasNextPage?: boolean; endCursor?: string | null } | undefined = data.product.media.pageInfo;
+      const variantPage: { hasNextPage?: boolean; endCursor?: string | null } | undefined = data.product.variants.pageInfo;
+      const hasMore = Boolean(imagePage?.hasNextPage || mediaPage?.hasNextPage || variantPage?.hasNextPage);
+      if (!hasMore) break;
+      imageCursor = imagePage?.hasNextPage ? imagePage.endCursor ?? imageCursor : imageCursor;
+      mediaCursor = mediaPage?.hasNextPage ? mediaPage.endCursor ?? mediaCursor : mediaCursor;
+      variantCursor = variantPage?.hasNextPage ? variantPage.endCursor ?? variantCursor : variantCursor;
+      if (page === 19) throw new ShopifyError('Shopify product exceeds the supported pagination limit.', 422, 'CATALOG_TOO_LARGE');
+    }
+    product.images.nodes = [...new Map(imageNodes.map((node) => [node.id, node])).values()];
+    product.media.nodes = [...new Map(mediaNodes.map((node) => [node.id, node])).values()];
+    product.variants.nodes = [...new Map(variantNodes.map((node) => [node.id, node])).values()];
     const variants: ShopifyVariant[] = product.variants.nodes.map((variant: any) => {
       const option = (name: string) => variant.selectedOptions.find((item: any) => item.name.toLowerCase() === name)?.value;
       const associatedImageIds = new Set<string>();

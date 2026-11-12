@@ -58,3 +58,28 @@ export interface ShopifyProductDetail extends ShopifyProductSummary {
   variants: ShopifyVariant[];
   images: ShopifyProductImage[];
 }
+
+export type BatchItemStatus = 'queued' | 'processing' | 'success' | 'skipped' | 'failed' | 'cancelled';
+export type BatchStatus = 'running' | 'completed' | 'partial' | 'cancelled';
+
+export interface MockupBatchItem {
+  color: string;
+  sourceImageId?: string;
+  status: BatchItemStatus;
+  reason?: string;
+  attempts: number;
+  preview?: ImageAsset;
+}
+
+export interface MockupBatch {
+  id: string;
+  productId: string;
+  productTitle: string;
+  backgroundId: string;
+  status: BatchStatus;
+  cancelRequested: boolean;
+  createdAt: string;
+  updatedAt: string;
+  items: MockupBatchItem[];
+  counts: { total: number; queued: number; processing: number; success: number; failed: number; skipped: number; cancelled: number };
+}

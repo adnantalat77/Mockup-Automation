@@ -8,19 +8,8 @@ type Fetcher = typeof fetch;
 type GraphqlResponse<T> = { data?: T; errors?: Array<{ message: string; extensions?: { code?: string } }>; extensions?: { cost?: { throttleStatus?: { currentlyAvailable?: number; restoreRate?: number } } } };
 type ImageNode = { id: string; url: string; altText?: string | null; width?: number | null; height?: number | null };
 type MediaNode = { id: string; mediaContentType: string; image?: ImageNode | null; preview?: { image?: ImageNode | null } | null };
-export interface ShopifyPublicationState { mediaIds: string[]; variants: Array<{ id: string; color?: string; mediaIds: string[] }> }
-interface PublicationStateResponse {
-  product: {
-    media: { nodes: Array<{ id: string }> };
-    variants: {
-      nodes: Array<{
-        id: string;
-        selectedOptions: Array<{ name: string; value: string }>;
-        media: { nodes: Array<{ id: string }> };
-      }>;
-    };
-  } | null;
-}
+export interface ShopifyPublicationState { complete: true; mediaIds: string[]; variants: Array<{ id: string; color?: string; mediaIds: string[] }> }
+type PageInfo = { hasNextPage: boolean; endCursor: string | null };
 
 const PRODUCT_GID = /^gid:\/\/shopify\/Product\/[1-9]\d*$/;
 const IMAGE_GID = /^gid:\/\/shopify\/(?:ProductImage|MediaImage)\/[1-9]\d*$/;
@@ -211,21 +200,63 @@ export class ShopifyService {
 
   async getPublicationState(productId: string): Promise<ShopifyPublicationState> {
     this.assertProductId(productId);
-    const product = await this.getProduct(productId, false);
-    const data = await this.graphql<PublicationStateResponse>(`
-      query PublicationState($id: ID!) {
+    const mediaIds: string[] = [];
+    let mediaCursor: string | null = null;
+    for (let page = 0; page < 100; page += 1) {
+      const data: { product: { media: { nodes: Array<{ id: string }>; pageInfo: PageInfo } } | null } = await this.graphql(`
+      query PublicationMedia($id: ID!, $after: String) {
         product(id: $id) {
-          media(first: 250) { nodes { id } }
-          variants(first: 250) { nodes { id selectedOptions { name value } media(first: 100) { nodes { id } } } }
+          media(first: 100, after: $after) { nodes { id } pageInfo { hasNextPage endCursor } }
         }
-      }
-    `, { id: productId });
-    if (!data.product) throw new ShopifyError('Shopify product not found.', 404, 'NOT_FOUND');
+      `, { id: productId, after: mediaCursor });
+      if (!data.product) throw new ShopifyError('Shopify product not found.', 404, 'NOT_FOUND');
+      mediaIds.push(...data.product.media.nodes.map((node) => node.id));
+      if (!data.product.media.pageInfo.hasNextPage) break;
+      const next = data.product.media.pageInfo.endCursor;
+      if (!next || next === mediaCursor || page === 99) throw new ShopifyError('Shopify media pagination could not be completed safely.', 502, 'INCOMPLETE_SNAPSHOT');
+      mediaCursor = next;
+    }
+
+    const variantNodes: Array<{ id: string; selectedOptions: Array<{ name: string; value: string }> }> = [];
+    let variantCursor: string | null = null;
+    for (let page = 0; page < 100; page += 1) {
+      const data: { product: { variants: { nodes: typeof variantNodes; pageInfo: PageInfo } } | null } = await this.graphql(`
+        query PublicationVariants($id: ID!, $after: String) {
+          product(id: $id) { variants(first: 100, after: $after) { nodes { id selectedOptions { name value } } pageInfo { hasNextPage endCursor } } }
+        }
+      `, { id: productId, after: variantCursor });
+      if (!data.product) throw new ShopifyError('Shopify product not found.', 404, 'NOT_FOUND');
+      variantNodes.push(...data.product.variants.nodes);
+      if (!data.product.variants.pageInfo.hasNextPage) break;
+      const next = data.product.variants.pageInfo.endCursor;
+      if (!next || next === variantCursor || page === 99) throw new ShopifyError('Shopify variant pagination could not be completed safely.', 502, 'INCOMPLETE_SNAPSHOT');
+      variantCursor = next;
+    }
+
     const color = (options: Array<{ name: string; value: string }>) => options.find((option) => ['color', 'colour'].includes(option.name.toLowerCase()))?.value;
-    const byId = new Map(product.variants.map((variant) => [variant.id, variant]));
+    const variants: ShopifyPublicationState['variants'] = [];
+    for (const variant of variantNodes) {
+      const variantMediaIds: string[] = [];
+      let cursor: string | null = null;
+      for (let page = 0; page < 100; page += 1) {
+        const data: { node: { media: { nodes: Array<{ id: string }>; pageInfo: PageInfo } } | null } = await this.graphql(`
+          query PublicationVariantMedia($id: ID!, $after: String) {
+            node(id: $id) { ... on ProductVariant { media(first: 100, after: $after) { nodes { id } pageInfo { hasNextPage endCursor } } } }
+          }
+        `, { id: variant.id, after: cursor });
+        if (!data.node) throw new ShopifyError('Shopify variant snapshot could not be completed safely.', 502, 'INCOMPLETE_SNAPSHOT');
+        variantMediaIds.push(...data.node.media.nodes.map((node) => node.id));
+        if (!data.node.media.pageInfo.hasNextPage) break;
+        const next = data.node.media.pageInfo.endCursor;
+        if (!next || next === cursor || page === 99) throw new ShopifyError('Shopify variant-media pagination could not be completed safely.', 502, 'INCOMPLETE_SNAPSHOT');
+        cursor = next;
+      }
+      variants.push({ id: variant.id, color: color(variant.selectedOptions), mediaIds: variantMediaIds });
+    }
     return {
-      mediaIds: data.product.media.nodes.map((media) => media.id),
-      variants: data.product.variants.nodes.map((variant) => ({ id: variant.id, color: color(variant.selectedOptions) ?? byId.get(variant.id)?.color, mediaIds: variant.media.nodes.map((media) => media.id) }))
+      complete: true,
+      mediaIds,
+      variants
     };
   }
 
@@ -324,6 +355,15 @@ export class ShopifyService {
     `, { fileIds: [fileId] });
     this.assertUserErrors(result.fileDelete.userErrors);
     if (!result.fileDelete.deletedFileIds.includes(fileId)) throw new ShopifyError('Shopify did not confirm file deletion.', 502, 'FILE_DELETE_FAILED');
+  }
+
+  async verifyFileDeletionSafe(fileId: string, productId: string): Promise<{ safe: boolean; reason: string }> {
+    this.assertMediaId(fileId); this.assertProductId(productId);
+    // Admin GraphQL 2026-10 exposes product references as write-only
+    // referencesToAdd/referencesToRemove inputs. It does not expose a complete
+    // inverse reference connection on File/MediaImage, so global ownership
+    // cannot be proven without an external ownership registry.
+    return { safe: false, reason: 'Shopify 2026-10 cannot enumerate every product reference for a file; global deletion requires manual confirmation.' };
   }
 
   private async waitForJob(jobId: string) {

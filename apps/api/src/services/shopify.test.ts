@@ -65,6 +65,29 @@ describe('ShopifyService', () => {
     expect(JSON.parse(fetcher.mock.calls[2][1].body).variables.variantAfter).toBe('next');
   });
 
+  it('fully paginates publication media, variants, and nested variant media', async () => {
+    const connection = (nodes: unknown[], hasNextPage = false, endCursor: string | null = null) => ({ nodes, pageInfo: { hasNextPage, endCursor } });
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(json({ access_token: 'token', expires_in: 3600 }))
+      .mockResolvedValueOnce(json({ data: { product: { media: connection([{ id: 'gid://shopify/MediaImage/1' }], true, 'm2') } } }))
+      .mockResolvedValueOnce(json({ data: { product: { media: connection([{ id: 'gid://shopify/MediaImage/2' }]) } } }))
+      .mockResolvedValueOnce(json({ data: { product: { variants: connection([{ id: 'gid://shopify/ProductVariant/1', selectedOptions: [{ name: 'Color', value: 'Black' }] }], true, 'v2') } } }))
+      .mockResolvedValueOnce(json({ data: { product: { variants: connection([{ id: 'gid://shopify/ProductVariant/2', selectedOptions: [{ name: 'Color', value: 'Navy' }] }]) } } }))
+      .mockResolvedValueOnce(json({ data: { node: { media: connection([{ id: 'gid://shopify/MediaImage/1' }], true, 'vm2') } } }))
+      .mockResolvedValueOnce(json({ data: { node: { media: connection([{ id: 'gid://shopify/MediaImage/2' }]) } } }))
+      .mockResolvedValueOnce(json({ data: { node: { media: connection([]) } } }));
+    const state = await new ShopifyService(config, fetcher as unknown as typeof fetch).getPublicationState('gid://shopify/Product/123');
+    expect(state).toMatchObject({ complete: true, mediaIds: ['gid://shopify/MediaImage/1', 'gid://shopify/MediaImage/2'] });
+    expect(state.variants[0].mediaIds).toEqual(['gid://shopify/MediaImage/1', 'gid://shopify/MediaImage/2']);
+    expect(JSON.parse(fetcher.mock.calls[6][1].body).variables.after).toBe('vm2');
+  });
+
+  it('fails safely when a publication cursor cannot advance', async () => {
+    const fetcher = vi.fn().mockResolvedValueOnce(json({ access_token: 'token', expires_in: 3600 }))
+      .mockResolvedValueOnce(json({ data: { product: { media: { nodes: [], pageInfo: { hasNextPage: true, endCursor: null } } } } }));
+    await expect(new ShopifyService(config, fetcher as unknown as typeof fetch).getPublicationState('gid://shopify/Product/123')).rejects.toMatchObject({ code: 'INCOMPLETE_SNAPSHOT' });
+  });
+
   it('refreshes an expired token once after a 401', async () => {
     const fetcher = vi.fn()
       .mockResolvedValueOnce(json({ access_token: 'old', expires_in: 3600 }))

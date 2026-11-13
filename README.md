@@ -66,13 +66,16 @@ Local source assets are stored beneath ignored `data/uploads/`; generated previe
 
 Publishing remains unavailable unless all three server-side gates pass: `SHOPIFY_PUBLISHING_ENABLED=true`, a private `SHOPIFY_PUBLISHING_AUTH_TOKEN` of at least 32 characters, and live verification of `read_products`, `write_products`, and `write_files`. The authorization value is entered only for a protected operation and sent in `X-Publish-Authorization`; it is not persisted by the browser. Mutation requests also require an approved local origin and an explicit `PUBLISH` or `ROLLBACK` confirmation value.
 
-Before publishing, the API re-fetches the product, validates every color-to-variant association and generated PNG, and writes checkpoint zero under ignored `data/publications/`. Every successful Shopify mutation creates another immutable, sequence-numbered checkpoint. Original media are retained. Rollback removes only media IDs recorded as created by that operation, restores recorded variant associations and ordering, and stops for manual review if unrelated media changed.
+Before publishing, the API completely paginates product media, variants, and each variant's media, validates every color-to-variant association and generated PNG, and writes checkpoint zero under ignored `data/publications/`. Every mutation has a preceding intent checkpoint and a following result checkpoint. Original media are retained. Partial retries reconcile the immutable snapshot against live Shopify state and stop on external drift or an uncertain file-creation result.
 
 The Shopify workflow uses staged uploads, `fileCreate`, file-processing polling, `fileUpdate` product references, `productVariantAppendMedia`/`productVariantDetachMedia`, `productReorderMedia`, and `fileDelete`. It does not use deprecated `productDeleteMedia`. See [docs/PHASE4_LIVE_TEST.md](docs/PHASE4_LIVE_TEST.md) before any separately approved live test.
+
+Published ordering is deterministic: all original media remain in their original order, followed by generated media in batch color order. The API verifies this ordering after Shopify's asynchronous reorder job. Checkpoints are written to uniquely named temporary files and atomically renamed; startup ignores temporary or malformed files and recovers the newest structurally valid checkpoint.
 
 ## Safety and current limitations
 
 - Shopify publishing is disabled by default and has not been exercised against a live store by the automated test suite. Product search remains available with `read_products` only.
+- Shopify Admin GraphQL 2026-10 does not expose a complete inverse list of product references from a file. Consequently, the production adapter refuses global `fileDelete` automatically after detaching the operation product; it preserves the file and reports a conflict for manual ownership verification. Tests exercise deletion only through an explicit mocked ownership proof.
 - No Printful sync, AI generation, background removal, garment recoloring, pricing, inventory, SKU, or fulfillment mutations.
 - Metadata is local JSON beside the assets. SQLite remains reserved for a later phase when durable relational metadata is needed.
 - EXIF orientation is normalized before background dimensions are chosen, so rotated portrait JPEGs produce portrait previews without stretching.

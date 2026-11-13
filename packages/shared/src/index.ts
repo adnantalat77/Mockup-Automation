@@ -91,6 +91,9 @@ export interface PublicationItem {
   previewId: string;
   variantIds: string[];
   createdMediaId?: string;
+  stagedResourceUrl?: string;
+  intent?: 'stage_upload' | 'create_file' | 'add_product_reference' | 'append_variants' | 'reorder_published' | 'detach_variants' | 'remove_product_reference' | 'delete_file' | 'restore_order';
+  uncertainCreation?: boolean;
   status: 'pending' | 'uploaded' | 'associated' | 'failed' | 'rolled_back';
   error?: string;
 }
@@ -106,6 +109,7 @@ export interface PublicationOperation {
   status: PublicationStatus;
   originalMediaOrder: string[];
   originalVariantMedia: Array<{ variantId: string; mediaIds: string[] }>;
+  expectedPublishedMediaOrder: string[];
   items: PublicationItem[];
   completedSteps: string[];
   errors: string[];

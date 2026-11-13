@@ -85,6 +85,16 @@ describe('ShopifyService', () => {
     expect(JSON.parse(fetcher.mock.calls[2][1].body).variables.variantAfter).toBe('next');
   });
 
+  it('fails closed when nested catalog variant media cannot be retrieved completely', async () => {
+    const connection = (nodes: unknown[]) => ({ nodes, pageInfo: { hasNextPage: false, endCursor: null } });
+    const product = { id: 'gid://shopify/Product/123', title: 'Shirt', handle: 'shirt', status: 'DRAFT', images: connection([]), media: connection([]), variants: connection([{
+      id: 'gid://shopify/ProductVariant/1', title: 'Black / M', selectedOptions: [{ name: 'Color', value: 'Black' }], image: null,
+      media: { nodes: [], pageInfo: { hasNextPage: true, endCursor: 'more-media' } }
+    }]) };
+    const fetcher = vi.fn().mockResolvedValueOnce(json({ access_token: 'token', expires_in: 3600 })).mockResolvedValueOnce(json({ data: { product } }));
+    await expect(new ShopifyService(config, fetcher as unknown as typeof fetch).getProduct(product.id, false)).rejects.toMatchObject({ code: 'INCOMPLETE_CATALOG_ASSOCIATION' });
+  });
+
   it('fully paginates publication media, variants, and nested variant media', async () => {
     const connection = (nodes: unknown[], hasNextPage = false, endCursor: string | null = null) => ({ nodes, pageInfo: { hasNextPage, endCursor } });
     const fetcher = vi.fn()

@@ -39,10 +39,16 @@ export class PublishingService {
       const operation = await this.readLatest(operationId).catch(() => undefined);
       if (!operation) continue;
       const uncertainItems = operation.items.filter((item) => item.intent === 'create_file' && !item.createdMediaId);
+      const uncertainDeletionItems = operation.items.filter((item) => item.intent === 'delete_file' && item.createdMediaId && !operation.completedSteps.includes(STEP('deleted', item.color)));
       if (uncertainItems.length) {
         for (const item of uncertainItems) { item.uncertainCreation = true; item.status = 'failed'; item.error = 'Shopify file creation may have completed before the process stopped; ownership is uncertain.'; }
+        operation.conflictKinds = ['uncertain_file_creation'];
         operation.status = 'conflict'; operation.errors = uncertainItems.map((item) => `${item.color}: interrupted fileCreate requires manual reconciliation; it will not be retried.`);
         await this.checkpoint(operation);
+      } else if (uncertainDeletionItems.length) {
+        for (const item of uncertainDeletionItems) item.cleanupOutcome = { kind: 'cleanup_outcome_uncertain', mediaId: item.createdMediaId!, recordedAt: new Date().toISOString(), phase: 'file_delete', reason: 'The process stopped after fileDelete intent was persisted; the mutation result is unknown.' };
+        operation.conflictKinds = ['cleanup_outcome_uncertain'];
+        operation.status = 'conflict'; operation.errors.push('Interrupted fileDelete requires manual reconciliation and will not be retried automatically.'); await this.checkpoint(operation);
       } else if (operation.status === 'publishing') { operation.status = 'partial'; operation.errors.push('Publishing was interrupted; live reconciliation is required before retry.'); await this.checkpoint(operation); }
       if (operation.status === 'rolling_back') { operation.status = 'rollback_partial'; operation.errors.push('Rollback was interrupted; live reconciliation is required before retry.'); await this.checkpoint(operation); }
       this.records.set(operation.id, operation);
@@ -171,10 +177,12 @@ export class PublishingService {
   async rollback(operationId: string) {
     const operation = this.get(operationId);
     if (!['published', 'partial', 'rollback_partial', 'conflict'].includes(operation.status)) throw new PublicationError('This operation is not eligible for rollback.', 409);
+    if (operation.items.some((item) => item.uncertainCreation || (item.intent === 'create_file' && !item.createdMediaId))) throw new PublicationError('Rollback cannot establish ownership of an uncertain file creation; manual reconciliation is required.', 409);
+    if (operation.items.some((item) => item.cleanupOutcome?.kind === 'cleanup_outcome_uncertain' || item.intent === 'delete_file')) throw new PublicationError('Rollback cannot retry an uncertain file deletion; manual reconciliation is required.', 409);
     return this.withLock(operation.productId, async () => {
       const current = await this.shopify.getPublicationState(operation.productId);
       const conflict = this.compareExpected(operation, current, 'rollback'); if (conflict) return this.markConflict(operation, `Rollback blocked: ${conflict}`);
-      operation.status = 'rolling_back'; operation.errors = []; operation.cleanupConflicts = []; operation.productRestored = false; await this.checkpoint(operation);
+      operation.status = 'rolling_back'; operation.errors = []; operation.cleanupConflicts = []; operation.conflictKinds = []; operation.productRestored = false; await this.checkpoint(operation);
       for (const item of [...operation.items].reverse()) {
         if (!item.createdMediaId || (item.status === 'rolled_back' && !item.cleanupPending)) continue;
         try {
@@ -200,12 +208,27 @@ export class PublishingService {
           if (current.mediaIds.includes(mediaId)) { await this.intent(operation, item, 'remove_product_reference'); await this.shopify.removeFileFromProduct(mediaId, operation.productId); item.intent = undefined; operation.completedSteps.push(STEP('removed-reference', item.color)); await this.checkpoint(operation); }
           const deletion = await this.shopify.verifyFileDeletionSafe(mediaId, operation.productId);
           if (!deletion.safe) {
+            if (deletion.reasonCode !== 'global_references_unverifiable') {
+              item.cleanupOutcome = { kind: 'cleanup_failed', mediaId, recordedAt: new Date().toISOString(), phase: 'ownership_verification', reason: deletion.reason };
+              throw new PublicationError('Generated-file ownership verification returned an unsupported result.', 409);
+            }
             item.status = 'rolled_back'; item.cleanupPending = true;
+            item.cleanupOutcome = { kind: 'retained_ownership_unproven', mediaId, recordedAt: new Date().toISOString(), reasonCode: deletion.reasonCode, reason: deletion.reason };
+            if (!operation.conflictKinds.includes('retained_file_ownership_unproven')) operation.conflictKinds.push('retained_file_ownership_unproven');
             const cleanupMessage = `${item.color}: generated file was preserved because deletion ownership is uncertain: ${deletion.reason}`;
             operation.cleanupConflicts.push(cleanupMessage); await this.checkpoint(operation); continue;
           }
-          await this.intent(operation, item, 'delete_file'); await this.shopify.deleteFile(mediaId); item.intent = undefined; operation.completedSteps.push(STEP('deleted', item.color)); item.status = 'rolled_back'; item.cleanupPending = false; item.error = undefined; await this.checkpoint(operation);
-        } catch (error) { item.error = error instanceof Error ? error.message : 'Rollback failed.'; operation.errors.push(`${item.color}: ${item.error}`); await this.checkpoint(operation); }
+          await this.intent(operation, item, 'delete_file'); await this.shopify.deleteFile(mediaId); item.intent = undefined; operation.completedSteps.push(STEP('deleted', item.color)); item.status = 'rolled_back'; item.cleanupPending = false;
+          item.cleanupOutcome = { kind: 'deleted_safely', mediaId, recordedAt: new Date().toISOString(), ownershipProof: 'exclusive_operation_ownership' };
+          item.error = undefined; await this.checkpoint(operation);
+        } catch (error) {
+          item.error = error instanceof Error ? error.message : 'Rollback failed.';
+          if (item.createdMediaId && item.intent === 'delete_file') item.cleanupOutcome = { kind: 'cleanup_outcome_uncertain', mediaId: item.createdMediaId, recordedAt: new Date().toISOString(), phase: 'file_delete', reason: item.error };
+          else if (item.createdMediaId && operation.completedSteps.includes(STEP('removed-reference', item.color)) && !item.cleanupOutcome) item.cleanupOutcome = { kind: 'cleanup_failed', mediaId: item.createdMediaId, recordedAt: new Date().toISOString(), phase: 'ownership_verification', reason: item.error };
+          const conflictKind = item.cleanupOutcome?.kind === 'cleanup_outcome_uncertain' ? 'cleanup_outcome_uncertain' : 'cleanup_failed';
+          if (!operation.conflictKinds.includes(conflictKind)) operation.conflictKinds.push(conflictKind);
+          operation.errors.push(`${item.color}: ${item.error}`); await this.checkpoint(operation);
+        }
       }
       if (operation.items.every((item) => !item.createdMediaId || item.status === 'rolled_back')) {
         const marker = operation.items[0]; if (marker) await this.intent(operation, marker, 'restore_order'); await this.shopify.reorderMedia(operation.productId, operation.originalMediaOrder); if (marker) marker.intent = undefined;
@@ -213,8 +236,8 @@ export class PublishingService {
         const live = await this.shopify.getPublicationState(operation.productId); const expectedVariants = new Map(operation.originalVariantMedia.map((v) => [v.variantId, v.mediaIds]));
         const restored = same(live.mediaIds, operation.originalMediaOrder) && live.variants.every((v) => same(v.mediaIds, expectedVariants.get(v.id) ?? []));
         operation.productRestored = restored;
-        if (!restored) { operation.status = 'conflict'; operation.errors.push('Product restoration did not match the immutable original snapshot.'); }
-        else if (operation.cleanupConflicts.length) { operation.status = 'conflict'; operation.errors.push('Product restoration succeeded, but generated-file cleanup requires manual review.'); }
+        if (!restored) { operation.status = 'conflict'; operation.conflictKinds.push('restoration_mismatch'); operation.errors.push('Product restoration did not match the immutable original snapshot.'); }
+        else if (operation.cleanupConflicts.length) operation.status = 'conflict';
         else operation.status = 'rolled_back';
       } else operation.status = 'rollback_partial';
       await this.checkpoint(operation); return operation;
@@ -272,9 +295,10 @@ export class PublishingService {
     if (operation.productRestored !== true) errors.push('Product restoration has not been recorded as complete.');
     if (!operation.items.length || operation.items.some((item) => item.status !== 'rolled_back')) errors.push('Every publication item must be rolled back.');
     if (!generated.length || generated.length !== operation.items.length || new Set(generated).size !== generated.length) errors.push('Generated media ownership records are incomplete or inconsistent.');
-    if (operation.items.some((item) => !item.createdMediaId || item.cleanupPending !== true || item.error)) errors.push('Every retained generated file must have structured cleanup-pending evidence and no item error.');
-    if ((operation.cleanupConflicts?.length ?? 0) !== generated.length) errors.push('Generated-file cleanup conflict evidence is incomplete.');
-    if (operation.errors.length !== 1) errors.push('The operation contains unresolved errors beyond the retained-file cleanup outcome.');
+    if (operation.items.some((item) => !item.createdMediaId || item.cleanupPending !== true || item.error)) errors.push('Every retained generated file must be cleanup-pending and have no item error.');
+    if (operation.items.some((item) => item.cleanupOutcome?.kind !== 'retained_ownership_unproven' || item.cleanupOutcome.reasonCode !== 'global_references_unverifiable' || item.cleanupOutcome.mediaId !== item.createdMediaId)) errors.push('Every generated file requires a machine-readable retained-ownership-unproven cleanup outcome. Legacy unfinalized conflicts must be reviewed manually and are not auto-classified.');
+    if (!operation.conflictKinds || operation.conflictKinds.length !== 1 || operation.conflictKinds[0] !== 'retained_file_ownership_unproven') errors.push('The operation contains a non-retained-file conflict classification or lacks structured historical conflict evidence.');
+    if (operation.errors.length > 0) errors.push('The operation contains unresolved errors in addition to its structured cleanup outcome.');
     if (!operation.completedSteps.includes('original-order-restored')) errors.push('Original media ordering was not checkpointed as restored.');
     for (const item of operation.items) {
       if (!operation.completedSteps.includes(STEP('removed-reference', item.color))) errors.push(`${item.color}: generated product reference removal was not checkpointed.`);
@@ -311,7 +335,8 @@ export class PublishingService {
       verifiedAt: new Date().toISOString(), operationId: operation.id, productId: product.id, productTitle: product.title, productStatus: product.status,
       snapshotComplete: true, originalMediaIdsVerified: [...state.mediaIds],
       originalVariantAssociationsVerified: state.variants.map((variant) => ({ variantId: variant.id, mediaIds: [...variant.mediaIds] })),
-      retainedGeneratedMediaIds: [...generated], retainedFileConflicts: [...(operation.cleanupConflicts ?? [])], cleanupReason: 'global_file_deletion_ownership_unproven'
+      retainedGeneratedMediaIds: [...generated], retainedFileConflicts: [...(operation.cleanupConflicts ?? [])],
+      retainedFileOutcomes: operation.items.map((item) => structuredClone(item.cleanupOutcome!)), cleanupReason: 'global_file_deletion_ownership_unproven'
     };
     return { eligible: errors.length === 0, operationId: operation.id, productId: operation.productId, retainedFileCount: generated.length, errors, evidence };
   }
@@ -397,6 +422,7 @@ export class PublishingService {
     const errors: string[] = []; let batch: MockupBatch; try { batch = await this.batches.get(batchId); } catch { throw new PublicationError('Batch not found.', 404); }
     if (batch.status !== 'completed') errors.push('The selected batch must be fully completed with no failed or skipped colors.');
     const [product, state] = await Promise.all([this.shopify.getProduct(batch.productId, false), this.shopify.getPublicationState(batch.productId)]); if (!state.complete) errors.push('Shopify publication snapshot is incomplete.');
+    if (product.id !== ABANDONMENT_TEST_PRODUCT_ID || product.title !== ABANDONMENT_TEST_PRODUCT_TITLE || product.status.toUpperCase() !== 'DRAFT') errors.push('Phase 4 publishing is restricted to the designated disposable draft test product.');
     const colors: Array<{ color: string; variantIds: string[]; previewId: string }> = [];
     for (const item of batch.items) {
       if (item.status !== 'success' || !item.preview || !item.sourceImageId) { errors.push(`${item.color}: generated preview or reliable source mapping is missing.`); continue; }
@@ -410,7 +436,7 @@ export class PublishingService {
   }
 
   private async intent(operation: PublicationOperation, item: PublicationItem, intent: NonNullable<PublicationItem['intent']>) { item.intent = intent; await this.checkpoint(operation); }
-  private async markConflict(operation: PublicationOperation, message: string) { operation.status = 'conflict'; operation.errors = [message]; await this.checkpoint(operation); return operation; }
+  private async markConflict(operation: PublicationOperation, message: string) { operation.status = 'conflict'; operation.conflictKinds ??= []; if (!operation.conflictKinds.includes('external_state_conflict')) operation.conflictKinds.push('external_state_conflict'); if (!operation.errors.includes(message)) operation.errors.push(message); await this.checkpoint(operation); return operation; }
   private async checkpoint(operation: PublicationOperation) {
     operation.updatedAt = new Date().toISOString(); const directory = path.join(this.folder, operation.id); await mkdir(directory, { recursive: true });
     const files = (await readdir(directory)).filter((name) => /^\d{6}\.json$/.test(name)); const sequence = files.length ? Math.max(...files.map((name) => Number(name.slice(0, 6)))) + 1 : 0;

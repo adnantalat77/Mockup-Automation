@@ -98,11 +98,20 @@ export interface RollbackFinalizationEvidence {
   originalVariantAssociationsVerified: Array<{ variantId: string; mediaIds: string[] }>;
   retainedGeneratedMediaIds: string[];
   retainedFileConflicts: string[];
+  retainedFileOutcomes?: GeneratedFileCleanupOutcome[];
   cleanupReason: 'global_file_deletion_ownership_unproven';
   previousStatus?: 'conflict';
   newStatus?: 'rolled_back_files_retained';
   confirmation?: string;
 }
+
+export type GeneratedFileCleanupOutcome =
+  | { kind: 'deleted_safely'; mediaId: string; recordedAt: string; ownershipProof: 'exclusive_operation_ownership' }
+  | { kind: 'retained_ownership_unproven'; mediaId: string; recordedAt: string; reasonCode: 'global_references_unverifiable'; reason: string }
+  | { kind: 'cleanup_failed'; mediaId: string; recordedAt: string; phase: 'ownership_verification' | 'reference_removal'; reason: string }
+  | { kind: 'cleanup_outcome_uncertain'; mediaId: string; recordedAt: string; phase: 'file_delete'; reason: string };
+
+export type PublicationConflictKind = 'retained_file_ownership_unproven' | 'cleanup_failed' | 'cleanup_outcome_uncertain' | 'uncertain_file_creation' | 'restoration_mismatch' | 'external_state_conflict';
 
 export interface RollbackFinalizationReadiness {
   eligible: boolean;
@@ -143,6 +152,7 @@ export interface PublicationItem {
   uncertainCreation?: boolean;
   cleanupPending?: boolean;
   cleanupDisposition?: 'retained_manual_ownership_review';
+  cleanupOutcome?: GeneratedFileCleanupOutcome;
   status: 'pending' | 'uploaded' | 'associated' | 'failed' | 'rolled_back';
   error?: string;
 }
@@ -164,6 +174,7 @@ export interface PublicationOperation {
   errors: string[];
   productRestored?: boolean;
   cleanupConflicts?: string[];
+  conflictKinds?: PublicationConflictKind[];
   abandonedAt?: string;
   abandonmentReason?: string;
   abandonmentEvidence?: AbandonmentEvidence;

@@ -83,7 +83,7 @@ export class ShopifyService {
             nodes {
               id title selectedOptions { name value }
               image { id url altText width height }
-              media(first: 100) { nodes { id mediaContentType preview { image { id url altText width height } } ... on MediaImage { image { id url altText width height } } } }
+              media(first: 100) { nodes { id mediaContentType preview { image { id url altText width height } } ... on MediaImage { image { id url altText width height } } } pageInfo { hasNextPage endCursor } }
             }
             pageInfo { hasNextPage endCursor }
           }
@@ -108,6 +108,7 @@ export class ShopifyService {
     product.images.nodes = [...new Map(imageNodes.map((node) => [node.id, node])).values()];
     product.media.nodes = [...new Map(mediaNodes.map((node) => [node.id, node])).values()];
     product.variants.nodes = [...new Map(variantNodes.map((node) => [node.id, node])).values()];
+    if (product.variants.nodes.some((variant: any) => variant.media?.pageInfo?.hasNextPage)) throw new ShopifyError('A variant media association exceeds the bounded catalog query; reliable color mapping cannot be established.', 422, 'INCOMPLETE_CATALOG_ASSOCIATION');
     const variants: ShopifyVariant[] = product.variants.nodes.map((variant: any) => {
       const option = (name: string) => variant.selectedOptions.find((item: any) => item.name.toLowerCase() === name)?.value;
       const associatedImageIds = new Set<string>();
@@ -375,13 +376,13 @@ export class ShopifyService {
     if (!result.fileDelete.deletedFileIds.includes(fileId)) throw new ShopifyError('Shopify did not confirm file deletion.', 502, 'FILE_DELETE_FAILED');
   }
 
-  async verifyFileDeletionSafe(fileId: string, productId: string): Promise<{ safe: boolean; reason: string }> {
+  async verifyFileDeletionSafe(fileId: string, productId: string): Promise<{ safe: boolean; reason: string; reasonCode: 'global_references_unverifiable' }> {
     this.assertMediaId(fileId); this.assertProductId(productId);
     // Admin GraphQL 2026-10 exposes product references as write-only
     // referencesToAdd/referencesToRemove inputs. It does not expose a complete
     // inverse reference connection on File/MediaImage, so global ownership
     // cannot be proven without an external ownership registry.
-    return { safe: false, reason: 'Shopify 2026-10 cannot enumerate every product reference for a file; global deletion requires manual confirmation.' };
+    return { safe: false, reason: 'Shopify 2026-10 cannot enumerate every product reference for a file; global deletion requires manual confirmation.', reasonCode: 'global_references_unverifiable' };
   }
 
   private async waitForJob(jobId: string) {
@@ -398,7 +399,7 @@ export class ShopifyService {
     if (!force && this.token && Date.now() < this.token.expiresAt - TOKEN_MARGIN_MS) return this.token.value;
     const response = await this.fetcher(`https://${this.config.shopDomain}/admin/oauth/access_token`, {
       method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
-      body: new URLSearchParams({ grant_type: 'client_credentials', client_id: this.config.clientId, client_secret: this.config.clientSecret })
+      body: new URLSearchParams({ grant_type: 'client_credentials', client_id: this.config.clientId, client_secret: this.config.clientSecret }), signal: AbortSignal.timeout(15_000)
     });
     const payload = await response.json().catch(() => ({})) as { access_token?: string; expires_in?: number; error?: string; error_description?: string };
     if (!response.ok || !payload.access_token) {
@@ -413,7 +414,7 @@ export class ShopifyService {
   private async graphql<T>(query: string, variables: Record<string, unknown> = {}, retry = true): Promise<T> {
     const token = await this.accessToken();
     const response = await this.fetcher(`https://${this.config.shopDomain}/admin/api/${this.config.apiVersion}/graphql.json`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'X-Shopify-Access-Token': token }, body: JSON.stringify({ query, variables })
+      method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'X-Shopify-Access-Token': token }, body: JSON.stringify({ query, variables }), signal: AbortSignal.timeout(30_000)
     });
     if (response.status === 401 && retry) { this.token = undefined; return this.graphql<T>(query, variables, false); }
     if (response.status === 429 && retry) {

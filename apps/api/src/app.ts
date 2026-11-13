@@ -11,6 +11,7 @@ import { loadConfig, type AppConfig } from './config.js';
 import { ShopifyError, ShopifyService } from './services/shopify.js';
 import { BatchError, BatchService } from './services/batches.js';
 import { PublicationError, PublishingService } from './services/publishing.js';
+import { PersistenceError } from './services/persistence.js';
 
 export function isPublishingOriginAllowed(origin: string | undefined, configuredOrigin: string, requireOrigin: boolean) {
   if (!origin) return !requireOrigin;
@@ -266,6 +267,7 @@ export async function createApp(overrides: Partial<AppConfig> = {}) {
     if (error instanceof ShopifyError) return response.status(error.status).json({ error: error.message });
     if (error instanceof BatchError) return response.status(error.status).json({ error: error.message });
     if (error instanceof PublicationError) return response.status(error.status).json({ error: error.message });
+    if (error instanceof PersistenceError) return response.status(error.code === 'ENOSPC' ? 507 : 500).json({ error: error.message });
     const clientError = error instanceof ImageValidationError || error?.message === 'Asset not found.';
     response.status(clientError ? 400 : 500).json({ error: clientError ? error.message : 'The request could not be completed.' });
   });

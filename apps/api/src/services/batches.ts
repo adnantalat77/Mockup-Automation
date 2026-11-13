@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import sharp from 'sharp';
 import type { GarmentSourceProvenance, MockupBatch, MockupBatchItem, ShopifyProductDetail } from '@mockup-automation/shared';
@@ -7,6 +7,7 @@ import { AssetStore } from './storage.js';
 import { analyzeTransparency, compositePreview, inspectImage } from './images.js';
 import { ShopifyError, ShopifyService } from './shopify.js';
 import { createStoredZip } from './zip.js';
+import { atomicWriteFile, recoverInterruptedReplacements, type AtomicWriter } from './persistence.js';
 
 const STRICT_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const MAX_BATCH_ITEMS = 50;
@@ -30,21 +31,24 @@ export class BatchService {
     private readonly assets: AssetStore,
     private readonly shopify: ShopifyReader,
     private readonly concurrency = 2,
-    private readonly compositor = compositePreview
+    private readonly compositor = compositePreview,
+    private readonly writer: AtomicWriter = atomicWriteFile
   ) { this.folder = path.join(dataDir, 'batches'); }
 
   async init() {
     await mkdir(this.folder, { recursive: true });
+    await recoverInterruptedReplacements(this.folder);
     for (const filename of await readdir(this.folder)) {
       if (!filename.endsWith('.json')) continue;
       try {
         const batch = JSON.parse(await readFile(path.join(this.folder, filename), 'utf8')) as MockupBatch;
+        if (!batch || batch.id !== filename.slice(0, -5) || !STRICT_UUID.test(batch.id) || !['running', 'completed', 'partial', 'cancelled'].includes(batch.status) || !Array.isArray(batch.items)) throw new BatchError(`Batch metadata ${filename} is structurally invalid.`, 500);
         this.records.set(batch.id, batch);
         if (batch.status === 'running') {
           for (const item of batch.items) if (item.status === 'queued' || item.status === 'processing') { item.status = 'failed'; item.reason = 'Interrupted before completion; regenerate this color.'; }
           batch.status = 'partial'; batch.updatedAt = new Date().toISOString(); await this.persist(batch);
         }
-      } catch { /* Invalid metadata is ignored and never executed. */ }
+      } catch (error) { throw new BatchError(`Batch recovery failed for ${filename}: ${error instanceof Error ? error.message : 'metadata is unreadable or corrupt.'}`, 500); }
     }
   }
 
@@ -219,15 +223,14 @@ export class BatchService {
   private async update(batch: MockupBatch) { batch.updatedAt = new Date().toISOString(); batch.counts = this.counts(batch.items); await this.persist(batch); }
   private counts(items: MockupBatchItem[]) { return { total: items.length, queued: items.filter((i) => i.status === 'queued').length, processing: items.filter((i) => i.status === 'processing').length, success: items.filter((i) => i.status === 'success').length, failed: items.filter((i) => i.status === 'failed').length, skipped: items.filter((i) => i.status === 'skipped').length, cancelled: items.filter((i) => i.status === 'cancelled').length }; }
   private async persist(batch: MockupBatch) {
-    this.records.set(batch.id, batch);
     const snapshot = JSON.stringify(batch, null, 2);
     const previous = this.writes.get(batch.id) ?? Promise.resolve();
     const next = previous.then(async () => {
       const destination = path.join(this.folder, `${batch.id}.json`);
-      await writeFile(destination, snapshot);
+      await this.writer(destination, snapshot);
     });
     this.writes.set(batch.id, next);
-    try { await next; } finally { if (this.writes.get(batch.id) === next) this.writes.delete(batch.id); }
+    try { await next; this.records.set(batch.id, batch); } finally { if (this.writes.get(batch.id) === next) this.writes.delete(batch.id); }
   }
   private assertId(id: string) { if (!STRICT_UUID.test(id)) throw new BatchError('Batch not found.', 404); }
   private transient(error: unknown) { return error instanceof ShopifyError && error.status >= 500; }

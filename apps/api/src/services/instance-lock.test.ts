@@ -130,6 +130,14 @@ describe('lock integration and identity', () => {
     await lock.release();
   });
 
+  it('blocks startup before mutable initialization when an interrupted restore journal exists', async () => {
+    const directory = await tempDir(); const marker = path.join(path.dirname(directory), `.${path.basename(directory)}.restore-transaction.json`);
+    await writeFile(marker, '{}'); let initialized = false;
+    await expect(startApi({ dataDir: directory }, { createApplication: async () => { initialized = true; return express(); }, listenPort: 0 })).rejects.toThrow(/interrupted restoration journal/);
+    expect(initialized).toBe(false); await rm(marker);
+    const lock = await acquireDataDirectoryLock(directory); await lock.release();
+  });
+
   it('retains ownership after a failed HTTP shutdown and permits a safe retry', async () => {
     const directory = await tempDir();
     const runtime = await startApi({ dataDir: directory }, { createApplication: async () => express(), listenPort: 0 });

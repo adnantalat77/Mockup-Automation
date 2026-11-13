@@ -1,11 +1,12 @@
 import crypto from 'node:crypto';
-import { mkdir, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises';
+import { access, mkdir, readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import type { AbandonReadiness, AbandonmentEvidence, MockupBatch, PublicationItem, PublicationOperation, PublishReadiness, RecoveryReadiness, RollbackFinalizationEvidence, RollbackFinalizationReadiness, RollbackMode } from '@mockup-automation/shared';
 import { analyzeTransparency, inspectImage } from './images.js';
 import { AssetStore } from './storage.js';
 import { BatchService } from './batches.js';
 import type { ShopifyPublicationState, ShopifyService } from './shopify.js';
+import { atomicWriteFile, type AtomicWriter } from './persistence.js';
 
 const STRICT_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const PRODUCT_GID = /^gid:\/\/shopify\/Product\/[1-9]\d*$/;
@@ -19,6 +20,7 @@ const ITEM_INTENTS = new Set(['stage_upload', 'create_file', 'add_product_refere
 type PublishingShopify = Pick<ShopifyService, 'getProduct' | 'getPublicationState' | 'downloadImage' | 'stageImage' | 'createImageFile' | 'waitForFileReady' | 'addFileToProduct' | 'removeFileFromProduct' | 'replaceVariantMedia' | 'detachVariantMedia' | 'reorderMedia'>;
 
 export class PublicationError extends Error { constructor(message: string, readonly status = 400) { super(message); } }
+export class PublicationPersistenceError extends Error { constructor(message: string, readonly cause?: unknown) { super(message); this.name = 'PublicationPersistenceError'; } }
 const same = (left: string[], right: string[]) => left.length === right.length && left.every((value, index) => value === right[index]);
 function structurallyValidOperation(value: unknown): value is PublicationOperation {
   if (!value || typeof value !== 'object') return false;
@@ -87,13 +89,29 @@ function terminalPublicationError(operation: PublicationOperation) {
   return undefined;
 }
 
+export function validatePublicationCheckpointData(parsed: unknown, directoryId: string, filename = 'checkpoint') {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new PublicationError(`Publication checkpoint integrity validation failed for ${filename}: expected an operation object.`, 409);
+  const candidate = structuredClone(parsed) as Partial<PublicationOperation>;
+  if (candidate.version === 1 && !Array.isArray(candidate.expectedPublishedMediaOrder) && Array.isArray(candidate.originalMediaOrder) && Array.isArray(candidate.items) && candidate.items.every((item) => item && typeof item === 'object')) {
+    candidate.expectedPublishedMediaOrder = [...candidate.originalMediaOrder, ...candidate.items.map((item) => item.createdMediaId).filter((mediaId): mediaId is string => Boolean(mediaId))];
+  }
+  if (!structurallyValidOperation(candidate)) throw new PublicationError(`Publication checkpoint integrity validation failed for ${filename}: required fields or field types are invalid.`, 409);
+  const integrityErrors = operationIntegrityErrors(candidate);
+  if (integrityErrors.length) throw new PublicationError(`Publication checkpoint integrity validation failed for ${filename}: ${integrityErrors.join(', ')}.`, 409);
+  if (candidate.id !== directoryId) throw new PublicationError(`Publication checkpoint integrity validation failed for ${filename}: operation ID does not match its directory.`, 409);
+  return candidate;
+}
+
 export class PublishingService {
   private readonly folder: string;
   private readonly records = new Map<string, PublicationOperation>();
   private readonly locks = new Set<string>();
+  private readonly persistenceBlockedProducts = new Set<string>();
+  private readonly restorationMarker: string;
   private readonly allowedProductIds: Set<string>;
-  constructor(dataDir: string, private readonly assets: AssetStore, private readonly batches: BatchService, private readonly shopify: PublishingShopify, allowedProductIds: string[] = []) {
+  constructor(dataDir: string, private readonly assets: AssetStore, private readonly batches: BatchService, private readonly shopify: PublishingShopify, allowedProductIds: string[] = [], private readonly checkpointWriter: AtomicWriter = atomicWriteFile) {
     this.folder = path.join(dataDir, 'publications');
+    this.restorationMarker = path.join(dataDir, 'RESTORED_FROM_BACKUP.json');
     if (allowedProductIds.some((id) => !PRODUCT_GID.test(id))) throw new PublicationError('SHOPIFY_PUBLISH_PRODUCT_IDS contains an invalid Shopify Product GID.', 500);
     this.allowedProductIds = new Set(allowedProductIds);
   }
@@ -134,6 +152,7 @@ export class PublishingService {
 
   async publish(batchId: string, confirmation = 'PUBLISH') {
     const batch = await this.batches.get(batchId).catch(() => { throw new PublicationError('Batch not found.', 404); });
+    await this.assertMutationAllowed(batch.productId);
     return this.withLock(batch.productId, async () => {
       const existing = this.list().find((operation) => operation.batchId === batchId);
       if (existing) throw new PublicationError(`Batch ${batchId} already has publication operation ${existing.id}. Generate a new batch for another publication.`, 409);
@@ -193,6 +212,7 @@ export class PublishingService {
   }
 
   async resume(operationId: string, batchId: string) {
+    await this.assertMutationAllowed(this.get(operationId).productId);
     const readiness = await this.validateRecovery(operationId, batchId);
     if (!readiness.eligible) throw new PublicationError(readiness.errors.join(' '), 409);
     return this.continuePublication(this.get(operationId), true);
@@ -215,7 +235,9 @@ export class PublishingService {
         if (item.status === 'associated') continue;
         if (item.uncertainCreation || (item.intent === 'create_file' && !item.createdMediaId)) return this.markConflict(operation!, `${item.color}: file creation result is uncertain and cannot be safely retried.`);
         try {
-          const bytes = (await this.assets.bytes('preview', item.previewId)).buffer;
+          let bytes: Buffer;
+          try { bytes = (await this.assets.bytes('preview', item.previewId)).buffer; }
+          catch (error) { return this.markConflict(operation!, `${item.color}: preview bytes changed or became unreadable after final source validation; publication stopped before upload. ${error instanceof Error ? error.message : ''}`); }
           if (operation.sourceValidationSchemaVersion === 1 && (!item.generationEvidence || item.generationEvidence.previewAssetId !== item.previewId || item.generationEvidence.previewSha256 !== this.hash(bytes))) return this.markConflict(operation, `${item.color}: preview bytes changed after final source validation; publication stopped before upload.`);
           const filename = `${operation.productTitle}-${item.color}.png`.replace(/[^a-z0-9._-]+/gi, '-');
           if (!item.stagedResourceUrl) { await this.intent(operation, item, 'stage_upload'); item.stagedResourceUrl = await this.shopify.stageImage(filename, bytes); item.intent = undefined; await this.checkpoint(operation); }
@@ -225,6 +247,7 @@ export class PublishingService {
               const file = await this.shopify.createImageFile(item.stagedResourceUrl, `${operation!.productTitle} - ${item.color} [${operation!.id}]`);
               item.createdMediaId = file.id; item.status = 'uploaded'; item.intent = undefined; operation!.completedSteps.push(STEP('created', item.color)); operation!.expectedPublishedMediaOrder.push(file.id); await this.checkpoint(operation!);
             } catch (error) {
+              if (error instanceof PublicationPersistenceError) throw error;
               item.uncertainCreation = true; item.error = error instanceof Error ? error.message : 'File creation result is uncertain.'; await this.checkpoint(operation!);
               return this.markConflict(operation!, `${item.color}: Shopify file creation returned no durable ownership proof; manual reconciliation is required.`);
             }
@@ -239,7 +262,7 @@ export class PublishingService {
             item.intent = undefined; operation!.completedSteps.push(STEP('variants', item.color)); await this.checkpoint(operation!);
           }
           item.status = 'associated'; item.error = undefined; await this.checkpoint(operation!);
-        } catch (error) { item.status = 'failed'; item.error = error instanceof Error ? error.message : 'Publication failed.'; operation!.errors.push(`${item.color}: ${item.error}`); await this.checkpoint(operation!); }
+        } catch (error) { if (error instanceof PublicationPersistenceError) throw error; item.status = 'failed'; item.error = error instanceof Error ? error.message : 'Publication failed.'; operation!.errors.push(`${item.color}: ${item.error}`); await this.checkpoint(operation!); }
       }
       if (operation!.items.every((item) => item.status === 'associated')) {
         const marker = operation!.items[0];
@@ -257,6 +280,7 @@ export class PublishingService {
               operation!.completedSteps.push(step); await this.checkpoint(operation!);
             }
           } catch (error) {
+            if (error instanceof PublicationPersistenceError) throw error;
             operation!.status = 'partial'; operation!.errors.push(error instanceof Error ? error.message : 'Original gallery reference removal failed.'); await this.checkpoint(operation!); return operation!;
           }
         }
@@ -266,6 +290,7 @@ export class PublishingService {
             await this.shopify.reorderMedia(operation!.productId, operation!.expectedPublishedMediaOrder); if (marker) marker.intent = undefined;
             operation!.completedSteps.push('published-order'); await this.checkpoint(operation!);
           } catch (error) {
+            if (error instanceof PublicationPersistenceError) throw error;
             operation!.status = 'partial'; operation!.errors.push(error instanceof Error ? error.message : 'Published ordering failed.'); await this.checkpoint(operation!); return operation!;
           }
         }
@@ -283,6 +308,7 @@ export class PublishingService {
   async rollback(operationId: string, mode: RollbackMode) {
     if (mode !== 'no_global_delete') throw new PublicationError('Explicit no_global_delete rollback mode is required.', 400);
     const operation = this.get(operationId);
+    await this.assertMutationAllowed(operation.productId);
     if (!['published', 'partial', 'rollback_partial', 'conflict'].includes(operation.status)) throw new PublicationError('This operation is not eligible for rollback.', 409);
     if (operation.items.some((item) => item.uncertainCreation || (item.intent === 'create_file' && !item.createdMediaId))) throw new PublicationError('Rollback cannot establish ownership of an uncertain file creation; manual reconciliation is required.', 409);
     if (operation.items.some((item) => item.cleanupOutcome?.kind === 'cleanup_outcome_uncertain' || item.intent === 'delete_file')) throw new PublicationError('Rollback cannot retry an uncertain file deletion; manual reconciliation is required.', 409);
@@ -305,6 +331,7 @@ export class PublishingService {
             }
             operation.completedSteps.push(step); await this.checkpoint(operation);
           } catch (error) {
+            if (error instanceof PublicationPersistenceError) throw error;
             operation.status = 'rollback_partial'; operation.errors.push(error instanceof Error ? error.message : `Original media ${originalMediaId} could not be reattached.`); await this.checkpoint(operation); return operation;
           }
         }
@@ -342,6 +369,7 @@ export class PublishingService {
           operation.cleanupConflicts.push(`${item.color}: generated Shopify File deliberately retained; global deletion was prohibited by the operator.`);
           item.error = undefined; await this.checkpoint(operation);
         } catch (error) {
+          if (error instanceof PublicationPersistenceError) throw error;
           item.error = error instanceof Error ? error.message : 'Rollback failed.';
           if (item.createdMediaId && item.intent === 'delete_file') item.cleanupOutcome = { kind: 'cleanup_outcome_uncertain', mediaId: item.createdMediaId, recordedAt: new Date().toISOString(), phase: 'file_delete', reason: item.error };
           const conflictKind = item.cleanupOutcome?.kind === 'cleanup_outcome_uncertain' ? 'cleanup_outcome_uncertain' : 'cleanup_failed';
@@ -372,6 +400,7 @@ export class PublishingService {
 
   async abandon(operationId: string, reason: string) {
     const operation = this.get(operationId);
+    await this.assertMutationAllowed(operation.productId);
     if (operation.status === 'abandoned') return operation;
     if (reason.trim().length < 10 || reason.length > 500) throw new PublicationError('Provide an abandonment reason between 10 and 500 characters.', 400);
     return this.withLock(operation.productId, async () => {
@@ -390,6 +419,7 @@ export class PublishingService {
 
   async finalizeRollback(operationId: string, confirmation: string) {
     const initial = this.get(operationId);
+    await this.assertMutationAllowed(initial.productId);
     const expectedConfirmation = `FINALIZE ${operationId} FILES RETAINED`;
     if (confirmation !== expectedConfirmation) throw new PublicationError('Explicit retained-files finalization confirmation with the operation ID is required.', 400);
     return this.withLock(initial.productId, async () => {
@@ -584,7 +614,7 @@ export class PublishingService {
         backgroundBytes = (await this.assets.bytes('background', batch.backgroundId)).buffer;
         previewBytes = (await this.assets.bytes('preview', item.preview.id)).buffer;
         await inspectImage(previewBytes, ['png']);
-      } catch { const reason = 'Source, background, or preview asset is missing or invalid.'; errors.push(`${item.color}: ${reason.toLowerCase()}`); sourceFreshness.push({ color: item.color, state: 'source_unavailable', reason }); continue; }
+      } catch (error) { const reason = `Source bytes or background/preview hash evidence is missing, unreadable, or invalid${error instanceof Error ? `: ${error.message}` : '.'}`; errors.push(`${item.color}: ${reason.toLowerCase()}`); sourceFreshness.push({ color: item.color, state: 'source_unavailable', reason }); continue; }
       const sourceHash = this.hash(sourceBytes); const backgroundHash = this.hash(backgroundBytes); const previewHash = this.hash(previewBytes);
       if (sourceHash !== provenance.sha256 || (item.sourceAsset?.sha256 && item.sourceAsset.sha256 !== sourceHash)) { const reason = 'Preserved source bytes no longer match their recorded SHA-256 hash.'; errors.push(`${item.color}: ${reason.toLowerCase()}`); sourceFreshness.push({ color: item.color, state: 'source_changed', reason }); continue; }
       if (!(await analyzeTransparency(sourceBytes)).isMeaningfullyTransparent) { const reason = 'Preserved garment source is no longer meaningfully transparent.'; errors.push(`${item.color}: ${reason.toLowerCase()}`); sourceFreshness.push({ color: item.color, state: 'source_changed', reason }); continue; }
@@ -628,14 +658,20 @@ export class PublishingService {
 
   private publicationConfirmation(productId: string) { return productId === ABANDONMENT_TEST_PRODUCT_ID ? 'PUBLISH' : `PUBLISH ${productId}`; }
 
-  private async intent(operation: PublicationOperation, item: PublicationItem, intent: NonNullable<PublicationItem['intent']>) { item.intent = intent; await this.checkpoint(operation); }
+  private async intent(operation: PublicationOperation, item: PublicationItem, intent: NonNullable<PublicationItem['intent']>) { await this.assertMutationAllowed(operation.productId); item.intent = intent; await this.checkpoint(operation); }
   private async markConflict(operation: PublicationOperation, message: string) { operation.status = 'conflict'; operation.conflictKinds ??= []; if (!operation.conflictKinds.includes('external_state_conflict')) operation.conflictKinds.push('external_state_conflict'); if (!operation.errors.includes(message)) operation.errors.push(message); await this.checkpoint(operation); return operation; }
   private async checkpoint(operation: PublicationOperation) {
-    operation.updatedAt = new Date().toISOString(); const directory = path.join(this.folder, operation.id); await mkdir(directory, { recursive: true });
-    const files = (await readdir(directory)).filter((name) => /^\d{6}\.json$/.test(name)); const sequence = files.length ? Math.max(...files.map((name) => Number(name.slice(0, 6)))) + 1 : 0;
-    const finalPath = path.join(directory, `${String(sequence).padStart(6, '0')}.json`); const tempPath = `${finalPath}.${crypto.randomUUID()}.tmp`;
-    try { await writeFile(tempPath, JSON.stringify(operation, null, 2), { flag: 'wx' }); await rename(tempPath, finalPath); } catch (error) { await unlink(tempPath).catch(() => undefined); throw error; }
-    this.records.set(operation.id, structuredClone(operation));
+    const updatedAt = new Date().toISOString(); const durable = structuredClone({ ...operation, updatedAt });
+    try {
+      const directory = path.join(this.folder, operation.id); await mkdir(directory, { recursive: true });
+      const files = (await readdir(directory)).filter((name) => /^\d{6}\.json$/.test(name)); const sequence = files.length ? Math.max(...files.map((name) => Number(name.slice(0, 6)))) + 1 : 0;
+      const finalPath = path.join(directory, `${String(sequence).padStart(6, '0')}.json`);
+      await this.checkpointWriter(finalPath, JSON.stringify(durable, null, 2));
+      operation.updatedAt = updatedAt; this.records.set(operation.id, durable);
+    } catch (error) {
+      this.persistenceBlockedProducts.add(operation.productId);
+      throw new PublicationPersistenceError(`Publication persistence failed for product ${operation.productId}; further state transitions are blocked until process restart and checkpoint reconciliation.`, error);
+    }
   }
   private async readLatest(id: string) {
     const directory = path.join(this.folder, id); const files = (await readdir(directory)).filter((name) => /^\d{6}\.json$/.test(name)).sort().reverse();
@@ -643,17 +679,7 @@ export class PublishingService {
       let parsed: unknown;
       try { parsed = JSON.parse(await readFile(path.join(directory, file), 'utf8')); }
       catch { continue; /* fall back from an incomplete or malformed write */ }
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new PublicationError(`Publication checkpoint integrity validation failed for ${file}: expected an operation object.`, 409);
-      const candidate = structuredClone(parsed) as Partial<PublicationOperation>;
-      const legacy = candidate;
-      if (legacy?.version === 1 && !Array.isArray(legacy.expectedPublishedMediaOrder) && Array.isArray(legacy.originalMediaOrder) && Array.isArray(legacy.items) && legacy.items.every((item) => item && typeof item === 'object')) {
-        legacy.expectedPublishedMediaOrder = [...legacy.originalMediaOrder, ...legacy.items.map((item) => item.createdMediaId).filter((mediaId): mediaId is string => Boolean(mediaId))];
-      }
-      if (!structurallyValidOperation(candidate)) throw new PublicationError(`Publication checkpoint integrity validation failed for ${file}: required fields or field types are invalid.`, 409);
-      const integrityErrors = operationIntegrityErrors(candidate);
-      if (integrityErrors.length) throw new PublicationError(`Publication checkpoint integrity validation failed for ${file}: ${integrityErrors.join(', ')}.`, 409);
-      if (candidate.id !== id) throw new PublicationError(`Publication checkpoint integrity validation failed for ${file}: operation ID does not match its directory.`, 409);
-      return candidate;
+      return validatePublicationCheckpointData(parsed, id, file);
     }
     throw new PublicationError('No complete publication checkpoint was found.', 409);
   }
@@ -665,5 +691,10 @@ export class PublishingService {
     return this.list().some((candidate) => candidate.productId === operation.productId && candidate.predecessorOperationId === operation.id);
   }
   private async withLock<T>(productId: string, action: () => Promise<T>) { if (this.locks.has(productId)) throw new PublicationError('Another publication or rollback is already running for this product.', 409); this.locks.add(productId); try { return await action(); } finally { this.locks.delete(productId); } }
+  private async assertMutationAllowed(productId: string) {
+    if (this.persistenceBlockedProducts.has(productId)) throw new PublicationError('Local publication persistence previously failed for this product. Restart the API and reconcile the latest durable checkpoint before any further state transition.', 503);
+    try { await access(this.restorationMarker); throw new PublicationError('Restored local data requires complete operator-controlled Shopify reconciliation before any publication, recovery, rollback, abandonment, or finalization transition. Marker clearing is not implemented.', 503); }
+    catch (error) { if (error instanceof PublicationError) throw error; if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new PublicationError('Restoration reconciliation state could not be verified; all publication transitions are blocked.', 503); }
+  }
   private assertId(id: string) { if (!STRICT_UUID.test(id)) throw new PublicationError('Publication operation not found.', 404); }
 }

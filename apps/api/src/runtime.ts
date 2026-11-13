@@ -1,4 +1,6 @@
 import type { Server } from 'node:http';
+import { access } from 'node:fs/promises';
+import path from 'node:path';
 import type { Express } from 'express';
 import { createApp } from './app.js';
 import { loadConfig, type AppConfig } from './config.js';
@@ -24,6 +26,9 @@ export async function startApi(
   const lock = await acquireDataDirectoryLock(config.dataDir);
   let server: Server | undefined;
   try {
+    const restoreJournal = path.join(path.dirname(lock.canonicalDataDir), `.${path.basename(lock.canonicalDataDir)}.restore-transaction.json`);
+    try { await access(restoreJournal); throw new Error(`An interrupted restoration journal exists at ${restoreJournal}. API startup is blocked until the preserved live, previous, and staged directories are reconciled.`); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
     const app = await dependencies.createApplication({ ...config, dataDir: lock.canonicalDataDir });
     server = await new Promise<Server>((resolve, reject) => {
       const candidate = app.listen(dependencies.listenPort ?? Number(process.env.API_PORT ?? 3001), '127.0.0.1');

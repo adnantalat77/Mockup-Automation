@@ -25,6 +25,8 @@ The API acquires an OS-backed exclusive lock for its canonical `DATA_DIR` before
 
 Publication and rollback recovery validate unique, complete Shopify snapshots; exact gallery ordering; exact variant GID sets and associations; internally consistent checkpoints; and all durable terminal steps. Contradictory complete checkpoints fail startup, while truncated writes fall back to the previous complete checkpoint. See [docs/TASK021_RECOVERY_INTEGRITY.md](docs/TASK021_RECOVERY_INTEGRITY.md).
 
+Critical local records use flushed temporary writes and atomic promotion, asset reads enforce recorded SHA-256 evidence, and malformed batch recovery fails closed. Backups and restores are explicit offline operations protected by the API data-directory lock; restored state never automatically replays Shopify mutations. See [docs/TASK022_OPERATIONAL_RESILIENCE.md](docs/TASK022_OPERATIONAL_RESILIENCE.md).
+
 Open <http://127.0.0.1:3000>. The API listens on <http://127.0.0.1:3001>. During local development, Vite proxies same-origin `/api` requests to the API, avoiding browser CORS and `localhost` IPv4/IPv6 resolution differences. The environment file is optional because local defaults are built in. For separate-origin production hosting only, set `VITE_API_URL` to the deployed API origin.
 
 ```powershell

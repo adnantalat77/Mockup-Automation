@@ -7,6 +7,7 @@ import type { ShopifyProductDetail } from '@mockup-automation/shared';
 import { AssetStore } from './storage.js';
 import { BatchService } from './batches.js';
 import { PublicationError, PublishingService } from './publishing.js';
+import { atomicWriteFile, PersistenceError } from './persistence.js';
 
 const image = { id: 'gid://shopify/ProductImage/10', mediaId: 'gid://shopify/MediaImage/50', url: 'https://cdn.shopify.com/black.png', associatedColors: ['Black'], association: 'reliable' as const, validation: 'transparent' as const };
 const product: ShopifyProductDetail = {
@@ -90,6 +91,44 @@ async function retainedRollbackFixture(selectedProduct: ShopifyProductDetail = p
 }
 
 describe('PublishingService', () => {
+  it.each([
+    ['write', 'ENOSPC', { beforeWrite: () => { throw Object.assign(new Error('injected write failure'), { code: 'ENOSPC' }); } }],
+    ['flush', 'EIO', { beforeFlush: () => { throw Object.assign(new Error('injected flush failure'), { code: 'EIO' }); } }],
+    ['rename', 'EACCES', { beforeRename: () => { throw Object.assign(new Error('injected rename failure'), { code: 'EACCES' }); } }]
+  ])('blocks mutation and later transitions when intent checkpoint %s fails', async (_boundary, code, hooks) => {
+    const base = await fixture(); let writes = 0;
+    const writer = vi.fn(async (destination: string, data: string | Buffer) => { writes += 1; if (writes === 3) await atomicWriteFile(destination, data, hooks); else await atomicWriteFile(destination, data); });
+    const publishing = new PublishingService(base.root, base.assets, base.batches, base.api as any, [], writer);
+    await publishing.init(); vi.clearAllMocks();
+    await expect(publishing.publish(base.batch.id)).rejects.toThrow(/persistence failed/);
+    expect(code).toBeTruthy();
+    expect(base.api.stageImage).not.toHaveBeenCalled(); expect(base.api.createImageFile).not.toHaveBeenCalled();
+    await expect(publishing.publish(base.batch.id)).rejects.toMatchObject({ status: 503 });
+  });
+
+  it('does not blindly continue or retry after mutation succeeds but result persistence fails', async () => {
+    const base = await fixture(); let writes = 0;
+    const writer = vi.fn(async (destination: string, data: string | Buffer) => { writes += 1; if (writes === 6) throw new PersistenceError('injected result persistence failure', 'ENOSPC'); await atomicWriteFile(destination, data); });
+    const publishing = new PublishingService(base.root, base.assets, base.batches, base.api as any, [], writer);
+    await publishing.init(); vi.clearAllMocks();
+    await expect(publishing.publish(base.batch.id)).rejects.toThrow(/persistence failed/);
+    expect(base.api.createImageFile).toHaveBeenCalledOnce(); expect(base.api.addFileToProduct).not.toHaveBeenCalled();
+    const operation = publishing.list()[0];
+    await expect(publishing.resume(operation.id, operation.batchId)).rejects.toMatchObject({ status: 503 });
+    expect(base.api.createImageFile).toHaveBeenCalledOnce();
+  });
+
+  it('blocks every publication state transition while restored-data reconciliation is pending', async () => {
+    const base = await fixture(); const operation = await base.publishing.publish(base.batch.id);
+    await writeFile(path.join(base.root, 'RESTORED_FROM_BACKUP.json'), JSON.stringify({ requiresShopifyReconciliation: true }));
+    vi.clearAllMocks();
+    await expect(base.publishing.publish(base.batch.id)).rejects.toMatchObject({ status: 503 });
+    await expect(base.publishing.resume(operation.id, operation.batchId)).rejects.toMatchObject({ status: 503 });
+    await expect(base.publishing.rollback(operation.id, 'no_global_delete')).rejects.toMatchObject({ status: 503 });
+    await expect(base.publishing.abandon(operation.id, 'Restoration reconciliation is still pending')).rejects.toMatchObject({ status: 503 });
+    await expect(base.publishing.finalizeRollback(operation.id, `FINALIZE ${operation.id} FILES RETAINED`)).rejects.toMatchObject({ status: 503 });
+    expect(base.api.getPublicationState).not.toHaveBeenCalled(); expect(base.api.createImageFile).not.toHaveBeenCalled(); expect(base.api.removeFileFromProduct).not.toHaveBeenCalled();
+  });
   it('requires the explicit no_global_delete rollback mode before reading Shopify', async () => {
     const { batch, publishing, api } = await fixture();
     const published = await publishing.publish(batch.id);

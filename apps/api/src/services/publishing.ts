@@ -8,6 +8,7 @@ import { BatchService } from './batches.js';
 import type { ShopifyPublicationState, ShopifyService } from './shopify.js';
 
 const STRICT_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const PRODUCT_GID = /^gid:\/\/shopify\/Product\/[1-9]\d*$/;
 const STEP = (kind: string, color: string) => `${kind}:${color}`;
 export const ABANDONMENT_TEST_PRODUCT_ID = 'gid://shopify/Product/15608846975264';
 const ABANDONMENT_TEST_PRODUCT_TITLE = 'Mockup Automation - TEST ONLY';
@@ -30,7 +31,12 @@ export class PublishingService {
   private readonly folder: string;
   private readonly records = new Map<string, PublicationOperation>();
   private readonly locks = new Set<string>();
-  constructor(dataDir: string, private readonly assets: AssetStore, private readonly batches: BatchService, private readonly shopify: PublishingShopify) { this.folder = path.join(dataDir, 'publications'); }
+  private readonly allowedProductIds: Set<string>;
+  constructor(dataDir: string, private readonly assets: AssetStore, private readonly batches: BatchService, private readonly shopify: PublishingShopify, allowedProductIds: string[] = []) {
+    this.folder = path.join(dataDir, 'publications');
+    if (allowedProductIds.some((id) => !PRODUCT_GID.test(id))) throw new PublicationError('SHOPIFY_PUBLISH_PRODUCT_IDS contains an invalid Shopify Product GID.', 500);
+    this.allowedProductIds = new Set(allowedProductIds);
+  }
 
   async init() {
     await mkdir(this.folder, { recursive: true });
@@ -57,23 +63,26 @@ export class PublishingService {
   list() { return [...this.records.values()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)); }
   get(id: string) { this.assertId(id); const operation = this.records.get(id); if (!operation) throw new PublicationError('Publication operation not found.', 404); return operation; }
   async validate(batchId: string): Promise<PublishReadiness> {
-    const { batch, errors, colors } = await this.preflight(batchId);
+    const { batch, state, errors, colors } = await this.preflight(batchId);
     const blocker = this.blockingOperation(batch.productId);
     if (blocker) errors.push(`Publication operation ${blocker.id} must be rolled back or abandoned before a fresh publication.`);
-    return { ready: !errors.length, batchId, productId: batch.productId, imageCount: colors.length, variantCount: colors.reduce((sum, item) => sum + item.variantIds.length, 0), colors: colors.map(({ color, variantIds, previewId }) => ({ color, variantCount: variantIds.length, previewId })), errors };
+    return { ready: !errors.length, batchId, productId: batch.productId, imageCount: colors.length, variantCount: colors.reduce((sum, item) => sum + item.variantIds.length, 0),
+      currentGalleryImageCount: state.mediaIds.length, expectedFinalGalleryImageCount: colors.length, confirmationText: this.publicationConfirmation(batch.productId), replacesGallery: true,
+      colors: colors.map(({ color, variantIds, previewId }) => ({ color, variantCount: variantIds.length, previewId })), errors };
   }
 
-  async publish(batchId: string) {
+  async publish(batchId: string, confirmation = 'PUBLISH') {
     const existing = this.list().find((op) => op.batchId === batchId && !TERMINAL_STATUSES.has(op.status));
     if (existing) throw new PublicationError(`Batch ${batchId} already has publication operation ${existing.id}. Use operation recovery instead of starting a new publication.`, 409);
     const context = await this.preflight(batchId);
     if (context.errors.length) throw new PublicationError(context.errors.join(' '), 409);
+    if (confirmation !== this.publicationConfirmation(context.batch.productId)) throw new PublicationError(`Explicit publication confirmation for product ${context.batch.productId} is required.`, 400);
     const blocker = this.blockingOperation(context.batch.productId);
     if (blocker) throw new PublicationError(`Publication operation ${blocker.id} must be rolled back or abandoned before a fresh publication.`, 409);
     const now = new Date().toISOString();
     const operation: PublicationOperation = { id: crypto.randomUUID(), version: 1, batchId, productId: context.batch.productId, productTitle: context.batch.productTitle,
-      createdAt: now, updatedAt: now, status: 'validated', originalMediaOrder: [...context.state.mediaIds],
-      originalVariantMedia: context.state.variants.map((v) => ({ variantId: v.id, mediaIds: [...v.mediaIds] })), expectedPublishedMediaOrder: [...context.state.mediaIds],
+      createdAt: now, updatedAt: now, status: 'validated', publicationMode: 'replace_gallery', originalMediaOrder: [...context.state.mediaIds],
+      originalVariantMedia: context.state.variants.map((v) => ({ variantId: v.id, mediaIds: [...v.mediaIds] })), expectedPublishedMediaOrder: [],
       items: context.colors.map((item) => ({ color: item.color, previewId: item.previewId, variantIds: item.variantIds, status: 'pending' })), completedSteps: [], errors: [] };
     this.records.set(operation.id, operation); await this.checkpoint(operation);
     return this.continuePublication(operation, false);
@@ -157,6 +166,23 @@ export class PublishingService {
       }
       if (operation!.items.every((item) => item.status === 'associated')) {
         const marker = operation!.items[0];
+        if (operation!.publicationMode === 'replace_gallery') {
+          try {
+            const live = await this.shopify.getPublicationState(operation!.productId);
+            for (const originalMediaId of operation!.originalMediaOrder) {
+              const step = `removed-original:${originalMediaId}`;
+              if (operation!.completedSteps.includes(step)) continue;
+              if (live.mediaIds.includes(originalMediaId)) {
+                if (marker) await this.intent(operation!, marker, 'remove_original_reference');
+                await this.shopify.removeFileFromProduct(originalMediaId, operation!.productId);
+                if (marker) marker.intent = undefined;
+              }
+              operation!.completedSteps.push(step); await this.checkpoint(operation!);
+            }
+          } catch (error) {
+            operation!.status = 'partial'; operation!.errors.push(error instanceof Error ? error.message : 'Original gallery reference removal failed.'); await this.checkpoint(operation!); return operation!;
+          }
+        }
         if (!operation!.completedSteps.includes('published-order')) {
           try {
             if (marker) await this.intent(operation!, marker, 'reorder_published');
@@ -166,7 +192,8 @@ export class PublishingService {
             operation!.status = 'partial'; operation!.errors.push(error instanceof Error ? error.message : 'Published ordering failed.'); await this.checkpoint(operation!); return operation!;
           }
         }
-        const conflict = this.compareExpected(operation!, await this.shopify.getPublicationState(operation!.productId), 'published');
+        const [publishedProduct, publishedState] = await Promise.all([this.shopify.getProduct(operation!.productId, false), this.shopify.getPublicationState(operation!.productId)]);
+        const conflict = publishedProduct.id !== operation!.productId || publishedProduct.title !== operation!.productTitle ? 'product identity changed during publication.' : this.compareExpected(operation!, publishedState, 'published');
         if (conflict) return this.markConflict(operation!, `Published state verification failed: ${conflict}`);
         operation!.status = 'published';
       } else operation!.status = 'partial';
@@ -183,6 +210,23 @@ export class PublishingService {
       const current = await this.shopify.getPublicationState(operation.productId);
       const conflict = this.compareExpected(operation, current, 'rollback'); if (conflict) return this.markConflict(operation, `Rollback blocked: ${conflict}`);
       operation.status = 'rolling_back'; operation.errors = []; operation.cleanupConflicts = []; operation.conflictKinds = []; operation.productRestored = false; await this.checkpoint(operation);
+      if (operation.publicationMode === 'replace_gallery') {
+        const marker = operation.items[0];
+        for (const originalMediaId of operation.originalMediaOrder) {
+          const step = `restored-original:${originalMediaId}`;
+          if (operation.completedSteps.includes(step)) continue;
+          try {
+            if (!current.mediaIds.includes(originalMediaId)) {
+              if (marker) await this.intent(operation, marker, 'restore_original_reference');
+              await this.shopify.addFileToProduct(originalMediaId, operation.productId);
+              if (marker) marker.intent = undefined;
+            }
+            operation.completedSteps.push(step); await this.checkpoint(operation);
+          } catch (error) {
+            operation.status = 'rollback_partial'; operation.errors.push(error instanceof Error ? error.message : `Original media ${originalMediaId} could not be reattached.`); await this.checkpoint(operation); return operation;
+          }
+        }
+      }
       for (const item of [...operation.items].reverse()) {
         if (!item.createdMediaId || (item.status === 'rolled_back' && !item.cleanupPending)) continue;
         try {
@@ -382,6 +426,10 @@ export class PublishingService {
       if (associated && !operation.completedSteps.includes(STEP('variants', item.color))) operation.completedSteps.push(STEP('variants', item.color));
       if (associated) item.status = 'associated';
     }
+    if (operation.publicationMode === 'replace_gallery') for (const originalMediaId of operation.originalMediaOrder) {
+      const step = `removed-original:${originalMediaId}`;
+      if (!live.mediaIds.includes(originalMediaId) && !operation.completedSteps.includes(step)) operation.completedSteps.push(step);
+    }
     const reorderMarker = operation.items.find((item) => item.intent === 'reorder_published');
     if (reorderMarker && same(live.mediaIds, operation.expectedPublishedMediaOrder)) {
       reorderMarker.intent = undefined;
@@ -392,13 +440,18 @@ export class PublishingService {
 
   private compareExpected(operation: PublicationOperation, live: ShopifyPublicationState, mode: 'publish-retry' | 'published' | 'rollback') {
     if (!live.complete) return 'Shopify returned an incomplete publication snapshot.';
+    const replacesGallery = operation.publicationMode === 'replace_gallery';
     const created = operation.items.map((item) => item.createdMediaId).filter((id): id is string => Boolean(id)); const allowed = new Set([...operation.originalMediaOrder, ...created]);
     if (live.mediaIds.some((id) => !allowed.has(id))) return 'unrelated product media changed externally.';
-    if (operation.originalMediaOrder.some((id) => !live.mediaIds.includes(id))) return 'original product media is missing.';
+    if (!replacesGallery && operation.originalMediaOrder.some((id) => !live.mediaIds.includes(id))) return 'original product media is missing.';
+    if (replacesGallery && mode === 'publish-retry') for (const originalMediaId of operation.originalMediaOrder) {
+      const removalRecorded = operation.completedSteps.includes(`removed-original:${originalMediaId}`);
+      if (removalRecorded && live.mediaIds.includes(originalMediaId)) return `original media ${originalMediaId} removal state conflicts with its checkpoint.`;
+    }
     if (mode !== 'rollback') for (const item of operation.items) {
       if (item.createdMediaId && operation.completedSteps.includes(STEP('product', item.color)) && !live.mediaIds.includes(item.createdMediaId)) return `${item.color} product media reference changed externally.`;
     }
-    if (!same(live.mediaIds.filter((id) => operation.originalMediaOrder.includes(id)), operation.originalMediaOrder)) return 'original product media ordering changed externally.';
+    if (!same(live.mediaIds.filter((id) => operation.originalMediaOrder.includes(id)), operation.originalMediaOrder.filter((id) => live.mediaIds.includes(id)))) return 'original product media ordering changed externally.';
     if (mode === 'published' && !same(live.mediaIds, operation.expectedPublishedMediaOrder)) return 'published media ordering does not match the recorded order.';
     const originals = new Map(operation.originalVariantMedia.map((entry) => [entry.variantId, entry.mediaIds]));
     for (const variant of live.variants) {
@@ -422,7 +475,9 @@ export class PublishingService {
     const errors: string[] = []; let batch: MockupBatch; try { batch = await this.batches.get(batchId); } catch { throw new PublicationError('Batch not found.', 404); }
     if (batch.status !== 'completed') errors.push('The selected batch must be fully completed with no failed or skipped colors.');
     const [product, state] = await Promise.all([this.shopify.getProduct(batch.productId, false), this.shopify.getPublicationState(batch.productId)]); if (!state.complete) errors.push('Shopify publication snapshot is incomplete.');
-    if (product.id !== ABANDONMENT_TEST_PRODUCT_ID || product.title !== ABANDONMENT_TEST_PRODUCT_TITLE || product.status.toUpperCase() !== 'DRAFT') errors.push('Phase 4 publishing is restricted to the designated disposable draft test product.');
+    const disposableTestProduct = product.id === ABANDONMENT_TEST_PRODUCT_ID && product.title === ABANDONMENT_TEST_PRODUCT_TITLE && product.status.toUpperCase() === 'DRAFT';
+    if (!disposableTestProduct && !this.allowedProductIds.has(product.id)) errors.push('This Shopify product is not approved by the server-side publishing allowlist.');
+    if (product.id !== batch.productId || product.title !== batch.productTitle) errors.push('The live Shopify product identity does not match the completed batch.');
     const colors: Array<{ color: string; variantIds: string[]; previewId: string }> = [];
     for (const item of batch.items) {
       if (item.status !== 'success' || !item.preview || !item.sourceImageId) { errors.push(`${item.color}: generated preview or reliable source mapping is missing.`); continue; }
@@ -432,8 +487,19 @@ export class PublishingService {
       try { await inspectImage((await this.assets.bytes('preview', item.preview.id)).buffer, ['png']); } catch { errors.push(`${item.color}: generated preview file is missing or invalid.`); continue; }
       colors.push({ color: item.color, variantIds: variants.map((v) => v.id), previewId: item.preview.id });
     }
+    const uniqueProductColors = new Set(product.variants.map((variant) => variant.color).filter((color): color is string => Boolean(color)));
+    const batchColors = new Set(colors.map((item) => item.color));
+    if (product.variants.some((variant) => !variant.color)) errors.push('Every Shopify variant must have an identifiable color option.');
+    if (batchColors.size !== colors.length) errors.push('The batch contains duplicate color outputs.');
+    for (const color of uniqueProductColors) if (!batchColors.has(color)) errors.push(`${color}: exactly one successful generated mockup is required.`);
+    if (batchColors.size !== uniqueProductColors.size) errors.push('The generated color set does not exactly match the Shopify variant color set.');
+    const mappedVariantIds = colors.flatMap((item) => item.variantIds);
+    if (mappedVariantIds.length !== product.variants.length || new Set(mappedVariantIds).size !== mappedVariantIds.length || product.variants.some((variant) => !mappedVariantIds.includes(variant.id))) errors.push('Every Shopify variant must map exactly once to its generated color image.');
+    if (colors.some((item) => item.variantIds.length > 250)) errors.push('A color exceeds Shopify’s 250-item mutation input limit.');
     return { batch, state, errors, colors };
   }
+
+  private publicationConfirmation(productId: string) { return productId === ABANDONMENT_TEST_PRODUCT_ID ? 'PUBLISH' : `PUBLISH ${productId}`; }
 
   private async intent(operation: PublicationOperation, item: PublicationItem, intent: NonNullable<PublicationItem['intent']>) { item.intent = intent; await this.checkpoint(operation); }
   private async markConflict(operation: PublicationOperation, message: string) { operation.status = 'conflict'; operation.conflictKinds ??= []; if (!operation.conflictKinds.includes('external_state_conflict')) operation.conflictKinds.push('external_state_conflict'); if (!operation.errors.includes(message)) operation.errors.push(message); await this.checkpoint(operation); return operation; }

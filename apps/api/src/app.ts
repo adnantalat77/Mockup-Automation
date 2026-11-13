@@ -29,7 +29,7 @@ export async function createApp(overrides: Partial<AppConfig> = {}) {
   }
   const batches = shopify ? new BatchService(config.dataDir, store, shopify) : undefined;
   if (batches) await batches.init();
-  const publishing = shopify && batches ? new PublishingService(config.dataDir, store, batches, shopify) : undefined;
+  const publishing = shopify && batches ? new PublishingService(config.dataDir, store, batches, shopify, config.publishingProductIds) : undefined;
   if (publishing) await publishing.init();
   const app = express();
   app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
@@ -151,8 +151,7 @@ export async function createApp(overrides: Partial<AppConfig> = {}) {
     try {
       authorizePublishing(request);
       await verifyPublishingScopes();
-      if (request.body?.confirm !== 'PUBLISH') throw new PublicationError('Explicit publish confirmation is required.', 400);
-      response.json(await publishing!.publish(String(request.body?.batchId ?? '')));
+      response.json(await publishing!.publish(String(request.body?.batchId ?? ''), String(request.body?.confirm ?? '')));
     } catch (error) { next(error); }
   });
 

@@ -148,7 +148,7 @@ export interface PublicationItem {
   variantIds: string[];
   createdMediaId?: string;
   stagedResourceUrl?: string;
-  intent?: 'stage_upload' | 'create_file' | 'add_product_reference' | 'append_variants' | 'replace_variants' | 'restore_variants' | 'reorder_published' | 'detach_variants' | 'remove_product_reference' | 'delete_file' | 'restore_order';
+  intent?: 'stage_upload' | 'create_file' | 'add_product_reference' | 'append_variants' | 'replace_variants' | 'remove_original_reference' | 'restore_original_reference' | 'restore_variants' | 'reorder_published' | 'detach_variants' | 'remove_product_reference' | 'delete_file' | 'restore_order';
   uncertainCreation?: boolean;
   cleanupPending?: boolean;
   cleanupDisposition?: 'retained_manual_ownership_review';
@@ -166,6 +166,7 @@ export interface PublicationOperation {
   createdAt: string;
   updatedAt: string;
   status: PublicationStatus;
+  publicationMode?: 'append_originals' | 'replace_gallery';
   originalMediaOrder: string[];
   originalVariantMedia: Array<{ variantId: string; mediaIds: string[] }>;
   expectedPublishedMediaOrder: string[];
@@ -188,6 +189,10 @@ export interface PublishReadiness {
   productId: string;
   imageCount: number;
   variantCount: number;
+  currentGalleryImageCount: number;
+  expectedFinalGalleryImageCount: number;
+  confirmationText: string;
+  replacesGallery: boolean;
   colors: Array<{ color: string; variantCount: number; previewId: string }>;
   errors: string[];
 }

@@ -14,7 +14,6 @@ type PageInfo = { hasNextPage: boolean; endCursor: string | null };
 const PRODUCT_GID = /^gid:\/\/shopify\/Product\/[1-9]\d*$/;
 const IMAGE_GID = /^gid:\/\/shopify\/(?:ProductImage|MediaImage)\/[1-9]\d*$/;
 const SHOP_DOMAIN = /^[a-z0-9][a-z0-9-]*\.myshopify\.com$/i;
-const MAX_SEARCH_RESULTS = 20;
 const MAX_PRODUCT_IMAGES = 250;
 const TOKEN_MARGIN_MS = 5 * 60 * 1000;
 
@@ -50,14 +49,26 @@ export class ShopifyService {
     const trimmed = title.trim();
     if (trimmed.length < 2 || trimmed.length > 200) throw new ShopifyError('Enter a product title between 2 and 200 characters.', 400, 'INVALID_SEARCH');
     const queryValue = `title:${JSON.stringify(trimmed)}`;
-    const data = await this.graphql<{ products: { nodes: Array<{ id: string; title: string; handle: string; status: string; featuredMedia?: MediaNode | null }> } }>(`
-      query ProductSearch($query: String!, $first: Int!) {
-        products(first: $first, query: $query, sortKey: TITLE) {
+    type SearchProduct = { id: string; title: string; handle: string; status: string; featuredMedia?: MediaNode | null };
+    const products: SearchProduct[] = [];
+    let after: string | null = null;
+    for (let page = 0; page < 5; page += 1) {
+      const data: { products: { nodes: SearchProduct[]; pageInfo: PageInfo } } = await this.graphql(`
+      query ProductSearch($query: String!, $first: Int!, $after: String) {
+        products(first: $first, after: $after, query: $query, sortKey: TITLE) {
           nodes { id title handle status featuredMedia { preview { image { id url altText width height } } } }
+          pageInfo { hasNextPage endCursor }
         }
       }
-    `, { query: queryValue, first: MAX_SEARCH_RESULTS });
-    return data.products.nodes.map((product) => ({
+    `, { query: queryValue, first: 20, after });
+      products.push(...data.products.nodes);
+      if (!data.products.pageInfo.hasNextPage) break;
+      const next = data.products.pageInfo.endCursor;
+      if (!next || next === after) throw new ShopifyError('Shopify product search pagination could not be completed safely.', 502, 'INCOMPLETE_SEARCH');
+      if (page === 4) throw new ShopifyError('More than 100 products match this search. Narrow the search to avoid incomplete results.', 422, 'SEARCH_TOO_BROAD');
+      after = next;
+    }
+    return products.map((product) => ({
       id: product.id, title: product.title, handle: product.handle, status: product.status,
       imageUrl: product.featuredMedia?.preview?.image?.url
     }));

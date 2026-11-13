@@ -49,11 +49,22 @@ describe('ShopifyService', () => {
   it('searches by title with bounded results', async () => {
     const fetcher = vi.fn()
       .mockResolvedValueOnce(json({ access_token: 'token', expires_in: 3600 }))
-      .mockResolvedValueOnce(json({ data: { products: { nodes: [{ id: 'gid://shopify/Product/123', title: 'Texas Shirt', handle: 'texas-shirt', status: 'ACTIVE', featuredMedia: null }] } } }));
+      .mockResolvedValueOnce(json({ data: { products: { nodes: [{ id: 'gid://shopify/Product/123', title: 'Texas Shirt', handle: 'texas-shirt', status: 'ACTIVE', featuredMedia: null }], pageInfo: { hasNextPage: false, endCursor: null } } } }));
     const service = new ShopifyService(config, fetcher as unknown as typeof fetch);
     await expect(service.searchProducts('Texas Shirt')).resolves.toHaveLength(1);
     const body = JSON.parse(fetcher.mock.calls[1][1].body);
-    expect(body.variables).toEqual({ query: 'title:"Texas Shirt"', first: 20 });
+    expect(body.variables).toEqual({ query: 'title:"Texas Shirt"', first: 20, after: null });
+  });
+
+  it('paginates catalog search results without silently truncating them', async () => {
+    const node = (id: number) => ({ id: `gid://shopify/Product/${id}`, title: `Shirt ${id}`, handle: `shirt-${id}`, status: 'ACTIVE', featuredMedia: null });
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(json({ access_token: 'token', expires_in: 3600 }))
+      .mockResolvedValueOnce(json({ data: { products: { nodes: Array.from({ length: 20 }, (_value, index) => node(index + 1)), pageInfo: { hasNextPage: true, endCursor: 'page-2' } } } }))
+      .mockResolvedValueOnce(json({ data: { products: { nodes: [node(21)], pageInfo: { hasNextPage: false, endCursor: null } } } }));
+    const results = await new ShopifyService(config, fetcher as unknown as typeof fetch).searchProducts('Shirt');
+    expect(results).toHaveLength(21);
+    expect(JSON.parse(fetcher.mock.calls[2][1].body).variables.after).toBe('page-2');
   });
 
   it('maps colors only from direct variant image associations', async () => {
@@ -185,7 +196,7 @@ describe('ShopifyService', () => {
       .mockResolvedValueOnce(json({ access_token: 'old', expires_in: 3600 }))
       .mockResolvedValueOnce(json({}, 401))
       .mockResolvedValueOnce(json({ access_token: 'new', expires_in: 3600 }))
-      .mockResolvedValueOnce(json({ data: { products: { nodes: [] } } }));
+      .mockResolvedValueOnce(json({ data: { products: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } }));
     await new ShopifyService(config, fetcher as unknown as typeof fetch).searchProducts('shirt');
     expect(fetcher).toHaveBeenCalledTimes(4);
   });
@@ -194,7 +205,7 @@ describe('ShopifyService', () => {
     const fetcher = vi.fn()
       .mockResolvedValueOnce(json({ access_token: 'token', expires_in: 3600 }))
       .mockResolvedValueOnce(json({}, 429, { 'Retry-After': '0.01' }))
-      .mockResolvedValueOnce(json({ data: { products: { nodes: [] } } }));
+      .mockResolvedValueOnce(json({ data: { products: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } }));
     await expect(new ShopifyService(config, fetcher as unknown as typeof fetch).searchProducts('shirt')).resolves.toEqual([]);
     expect(fetcher).toHaveBeenCalledTimes(3);
   });

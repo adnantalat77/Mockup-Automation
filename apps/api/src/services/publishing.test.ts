@@ -14,26 +14,41 @@ const product: ShopifyProductDetail = {
   variants: [1, 2].map((id) => ({ id: `gid://shopify/ProductVariant/${id}`, title: `Black / ${id === 1 ? 'M' : 'L'}`, color: 'Black', size: id === 1 ? 'M' : 'L', selectedOptions: [{ name: 'Color', value: 'Black' }], associatedImageIds: [image.id] }))
 };
 
+const largeColors = ['Black', 'Navy', 'White', 'Red', 'Green', 'Blue', 'Gray', 'Gold'];
+const largeProduct: ShopifyProductDetail = {
+  id: 'gid://shopify/Product/999', title: 'Allowlisted Production Shirt', handle: 'allowlisted-shirt', status: 'ACTIVE', colors: largeColors,
+  sizes: Array.from({ length: 10 }, (_value, index) => `Size ${index + 1}`),
+  images: largeColors.map((color, index) => ({ id: `gid://shopify/MediaImage/${50 + index}`, url: `https://cdn.shopify.com/${color.toLowerCase()}.png`, associatedColors: [color], association: 'reliable', validation: 'transparent' })),
+  variants: largeColors.flatMap((color, colorIndex) => Array.from({ length: 10 }, (_value, sizeIndex) => ({
+    id: `gid://shopify/ProductVariant/${1000 + colorIndex * 10 + sizeIndex}`, title: `${color} / Size ${sizeIndex + 1}`, color, size: `Size ${sizeIndex + 1}`,
+    selectedOptions: [{ name: 'Color', value: color }, { name: 'Size', value: `Size ${sizeIndex + 1}` }], associatedImageIds: [`gid://shopify/MediaImage/${50 + colorIndex}`]
+  })))
+};
+
 async function waitBatch(service: BatchService, id: string) {
   for (let attempt = 0; attempt < 100; attempt += 1) { const batch = await service.get(id); if (batch.status !== 'running') return batch; await new Promise((resolve) => setTimeout(resolve, 5)); }
   throw new Error('Batch timeout');
 }
 
-async function fixture(overrides: Record<string, unknown> = {}) {
+async function fixture(overrides: Record<string, unknown> = {}, selectedProduct: ShopifyProductDetail = product, allowedProductIds: string[] = []) {
   const root = await mkdtemp(path.join(tmpdir(), 'publish-'));
   const assets = new AssetStore(root); await assets.init();
   const backgroundBytes = await sharp({ create: { width: 30, height: 30, channels: 3, background: '#fff' } }).png().toBuffer();
   const garment = await sharp({ create: { width: 20, height: 20, channels: 4, background: { r: 20, g: 30, b: 40, alpha: 0.5 } } }).png().toBuffer();
   const background = await assets.save('background', backgroundBytes, 'png', { originalName: 'background.png', width: 30, height: 30 });
-  const reader = { getProduct: vi.fn().mockResolvedValue(product), downloadImage: vi.fn().mockResolvedValue(garment) };
+  const reader = { getProduct: vi.fn().mockResolvedValue(selectedProduct), downloadImage: vi.fn().mockResolvedValue(garment) };
   const batches = new BatchService(root, assets, reader as any); await batches.init();
-  const batch = await waitBatch(batches, (await batches.create(product.id, background.id)).id);
-  const live = { complete: true as const, mediaIds: ['gid://shopify/MediaImage/50'], variants: product.variants.map((variant) => ({ id: variant.id, color: variant.color, mediaIds: ['gid://shopify/MediaImage/50'] })) };
+  const batch = await waitBatch(batches, (await batches.create(selectedProduct.id, background.id)).id);
+  const originalMediaIds = selectedProduct.images.map((entry, index) => entry.id.startsWith('gid://shopify/MediaImage/') ? entry.id : `gid://shopify/MediaImage/${50 + index}`);
+  const mediaByImageId = new Map(selectedProduct.images.map((entry, index) => [entry.id, originalMediaIds[index]]));
+  const live = { complete: true as const, mediaIds: [...originalMediaIds], variants: selectedProduct.variants.map((variant) => ({ id: variant.id, color: variant.color, mediaIds: [mediaByImageId.get(variant.associatedImageIds[0]) ?? originalMediaIds[0]] })) };
+  let createdIndex = 0;
+  const generatedMediaIds = selectedProduct === product ? ['gid://shopify/MediaImage/99'] : selectedProduct.images.map((_entry, index) => `gid://shopify/MediaImage/${100 + index}`);
   const api = {
-    getProduct: vi.fn().mockResolvedValue(product),
+    getProduct: vi.fn().mockResolvedValue(selectedProduct),
     getPublicationState: vi.fn().mockImplementation(async () => structuredClone(live)),
     stageImage: vi.fn().mockResolvedValue('https://staged.example/image'),
-    createImageFile: vi.fn().mockResolvedValue({ id: 'gid://shopify/MediaImage/99', fileStatus: 'PROCESSING' }),
+    createImageFile: vi.fn().mockImplementation(async () => ({ id: generatedMediaIds[createdIndex++], fileStatus: 'PROCESSING' })),
     waitForFileReady: vi.fn().mockResolvedValue(undefined), addFileToProduct: vi.fn().mockImplementation(async (id: string) => { if (!live.mediaIds.includes(id)) live.mediaIds.push(id); }),
     removeFileFromProduct: vi.fn().mockResolvedValue(undefined), appendVariantMedia: vi.fn().mockResolvedValue(undefined),
     replaceVariantMedia: vi.fn().mockResolvedValue(undefined),
@@ -45,7 +60,7 @@ async function fixture(overrides: Record<string, unknown> = {}) {
   api.replaceVariantMedia.mockImplementation(async (_productId: string, mediaId: string, variantIds: string[]) => { for (const variant of live.variants) if (variantIds.includes(variant.id)) variant.mediaIds = [mediaId]; });
   api.detachVariantMedia.mockImplementation(async (_productId: string, mediaId: string, variantIds: string[]) => { for (const variant of live.variants) if (variantIds.includes(variant.id)) variant.mediaIds = variant.mediaIds.filter((id) => id !== mediaId); });
   api.removeFileFromProduct.mockImplementation(async (mediaId: string) => { live.mediaIds = live.mediaIds.filter((id) => id !== mediaId); });
-  const publishing = new PublishingService(root, assets, batches, api as any); await publishing.init();
+  const publishing = new PublishingService(root, assets, batches, api as any, allowedProductIds); await publishing.init();
   return { root, assets, batches, batch, background, api, publishing, live };
 }
 
@@ -81,11 +96,51 @@ describe('PublishingService', () => {
     expect(api.appendVariantMedia).not.toHaveBeenCalled();
   });
 
-  it('rejects new publication for products outside the designated disposable draft test product', async () => {
+  it('replaces an allowlisted 80-variant gallery with one generated image per color and fully restores it', async () => {
+    const { batch, api, publishing, live } = await fixture({}, largeProduct, [largeProduct.id]);
+    await expect(publishing.validate(batch.id)).resolves.toMatchObject({
+      ready: true, imageCount: 8, variantCount: 80, currentGalleryImageCount: 8, expectedFinalGalleryImageCount: 8,
+      confirmationText: `PUBLISH ${largeProduct.id}`, replacesGallery: true
+    });
+    await expect(publishing.publish(batch.id, 'PUBLISH')).rejects.toBeInstanceOf(PublicationError);
+    const published = await publishing.publish(batch.id, `PUBLISH ${largeProduct.id}`);
+    expect(published).toMatchObject({ status: 'published', publicationMode: 'replace_gallery' });
+    expect(live.mediaIds).toEqual(largeColors.map((_color, index) => `gid://shopify/MediaImage/${100 + index}`));
+    expect(new Set(live.variants.map((variant) => variant.mediaIds[0]))).toEqual(new Set(live.mediaIds));
+    for (let colorIndex = 0; colorIndex < largeColors.length; colorIndex += 1) {
+      const expectedMedia = `gid://shopify/MediaImage/${100 + colorIndex}`;
+      expect(live.variants.filter((variant) => variant.color === largeColors[colorIndex]).every((variant) => variant.mediaIds[0] === expectedMedia)).toBe(true);
+    }
+    expect(api.removeFileFromProduct).toHaveBeenCalledTimes(8);
+    expect(api.deleteFile).not.toHaveBeenCalled();
+
+    const rolledBack = await publishing.rollback(published.id);
+    expect(rolledBack.status).toBe('rolled_back');
+    expect(live.mediaIds).toEqual(largeColors.map((_color, index) => `gid://shopify/MediaImage/${50 + index}`));
+    for (let colorIndex = 0; colorIndex < largeColors.length; colorIndex += 1) {
+      const originalMedia = `gid://shopify/MediaImage/${50 + colorIndex}`;
+      expect(live.variants.filter((variant) => variant.color === largeColors[colorIndex]).every((variant) => variant.mediaIds[0] === originalMedia)).toBe(true);
+    }
+  });
+
+  it('recovers an interrupted original-reference removal without repeating the mutation', async () => {
+    const { batch, api, publishing, live } = await fixture();
+    api.removeFileFromProduct.mockImplementationOnce(async (mediaId: string) => {
+      live.mediaIds = live.mediaIds.filter((id) => id !== mediaId);
+      throw new Error('connection lost after reference removal');
+    });
+    const partial = await publishing.publish(batch.id);
+    expect(partial).toMatchObject({ status: 'partial', items: [{ intent: 'remove_original_reference' }] });
+    await expect(publishing.resume(partial.id, batch.id)).resolves.toMatchObject({ status: 'published' });
+    expect(api.removeFileFromProduct).toHaveBeenCalledOnce();
+    expect(live.mediaIds).toEqual(['gid://shopify/MediaImage/99']);
+  });
+
+  it('rejects new publication for products outside the server-side allowlist', async () => {
     const productionProduct = { ...product, id: 'gid://shopify/Product/999', title: 'Production Shirt', status: 'ACTIVE' };
     const { batch, publishing, api } = await fixture({ getProduct: vi.fn().mockResolvedValue(productionProduct) });
     api.getProduct.mockResolvedValue(productionProduct);
-    await expect(publishing.validate(batch.id)).resolves.toMatchObject({ ready: false, errors: [expect.stringMatching(/disposable draft test product/)] });
+    await expect(publishing.validate(batch.id)).resolves.toMatchObject({ ready: false, errors: expect.arrayContaining([expect.stringMatching(/allowlist/)]) });
     await expect(publishing.publish(batch.id)).rejects.toBeInstanceOf(PublicationError);
     expect(api.createImageFile).not.toHaveBeenCalled();
   });
@@ -267,6 +322,19 @@ describe('PublishingService', () => {
     expect(api.reorderMedia).toHaveBeenCalledOnce();
   });
 
+  it('keeps historical append-style operation semantics when publicationMode is absent', async () => {
+    const { batch, publishing, live } = await fixture();
+    const published = await publishing.publish(batch.id);
+    const historical = publishing.get(published.id);
+    historical.status = 'partial';
+    delete historical.publicationMode;
+    historical.expectedPublishedMediaOrder = ['gid://shopify/MediaImage/50', 'gid://shopify/MediaImage/99'];
+    live.mediaIds = [...historical.expectedPublishedMediaOrder];
+    await expect(publishing.resume(historical.id, batch.id)).resolves.toMatchObject({
+      status: 'published', expectedPublishedMediaOrder: ['gid://shopify/MediaImage/50', 'gid://shopify/MediaImage/99']
+    });
+  });
+
   it('validates an existing partial operation separately and resumes it without creating a duplicate operation', async () => {
     const { batch, publishing, api } = await fixture();
     api.reorderMedia.mockRejectedValueOnce(new Error('order job unavailable'));
@@ -294,14 +362,14 @@ describe('PublishingService', () => {
     await expect(publishing.validateRecovery(operation.id, batch.id)).resolves.toMatchObject({ eligible: false, errors: [expect.stringMatching(/abandoned/i)] });
   });
 
-  it('safely retries an interrupted reorder when live ordering has not completed', async () => {
+  it('reconciles an interrupted reorder when the expected live order already completed', async () => {
     const { batch, publishing, api, live } = await fixture();
-    api.reorderMedia.mockImplementationOnce(async () => { live.mediaIds = ['gid://shopify/MediaImage/99', 'gid://shopify/MediaImage/50']; throw new Error('job polling failed'); })
+    api.reorderMedia.mockImplementationOnce(async () => { live.mediaIds = ['gid://shopify/MediaImage/99']; throw new Error('job polling failed'); })
       .mockImplementation(async (_id: string, ids: string[]) => { live.mediaIds = [...ids]; });
     const operation = await publishing.publish(batch.id);
     expect(operation).toMatchObject({ status: 'partial', items: [{ intent: 'reorder_published' }] });
     await expect(publishing.resume(operation.id, batch.id)).resolves.toMatchObject({ status: 'published' });
-    expect(api.createImageFile).toHaveBeenCalledOnce(); expect(api.replaceVariantMedia).toHaveBeenCalledOnce(); expect(api.reorderMedia).toHaveBeenCalledTimes(2);
+    expect(api.createImageFile).toHaveBeenCalledOnce(); expect(api.replaceVariantMedia).toHaveBeenCalledOnce(); expect(api.reorderMedia).toHaveBeenCalledOnce();
   });
 
   it('fails closed on unexpected media while reconciling interrupted reordering', async () => {

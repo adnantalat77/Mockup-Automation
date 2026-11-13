@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { AbandonReadiness, ApiError, ImageAsset, MockupBatch, PublicationOperation, PublishReadiness, ShopifyProductDetail, ShopifyProductSummary, ShopifyStatus } from '@mockup-automation/shared';
+import type { AbandonReadiness, ApiError, ImageAsset, MockupBatch, PublicationOperation, PublishReadiness, RecoveryReadiness, ShopifyProductDetail, ShopifyProductSummary, ShopifyStatus } from '@mockup-automation/shared';
 import { validateAndRefreshHistory } from './publishing-state.js';
 
 // Development stays same-origin through Vite's /api proxy. A production host
@@ -156,6 +156,7 @@ function PublishingPanel({ batch, product }: { batch?: MockupBatch; product?: Sh
   const [error, setError] = useState('');
   const [historyError, setHistoryError] = useState('');
   const [abandonReview, setAbandonReview] = useState<{ operation: PublicationOperation; readiness: AbandonReadiness }>();
+  const [recoveryReview, setRecoveryReview] = useState<{ operation: PublicationOperation; readiness: RecoveryReadiness }>();
 
   useEffect(() => { void apiJson<{ enabled: boolean; reason?: string }>('/api/publishing/status').then(setStatus); }, []);
   const authorized = (path: string, init: RequestInit = {}) => apiJson<any>(path, { ...init, headers: { 'Content-Type': 'application/json', 'X-Publish-Authorization': authorization, ...(init.headers ?? {}) } });
@@ -185,6 +186,25 @@ function PublishingPanel({ batch, product }: { batch?: MockupBatch; product?: Sh
     setBusy(true); setError(''); try { await authorized(`/api/publishing/${operation.id}/rollback`, { method: 'POST', body: JSON.stringify({ confirm: 'ROLLBACK' }) }); await refreshHistorySafely(); }
     catch (cause) { setError(cause instanceof Error ? cause.message : 'Rollback failed.'); } finally { setBusy(false); }
   }
+  async function verifyRecovery(operation: PublicationOperation) {
+    setBusy(true); setError(''); setRecoveryReview(undefined);
+    try {
+      const recovery = await authorized(`/api/publishing/${operation.id}/recovery/validate`, { method: 'POST', body: JSON.stringify({ batchId: operation.batchId }) });
+      setRecoveryReview({ operation, readiness: recovery });
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Recovery verification failed.'); }
+    finally { setBusy(false); }
+  }
+  async function resumeSelected() {
+    if (!recoveryReview?.readiness.eligible) return;
+    const { operation } = recoveryReview; const expected = `RESUME ${operation.id}`;
+    if (!window.confirm(`Resume publication operation ${operation.id}? Live Shopify state will be reconciled again before any remaining step.`)) return;
+    setBusy(true); setError('');
+    try {
+      await authorized(`/api/publishing/${operation.id}/resume`, { method: 'POST', body: JSON.stringify({ batchId: operation.batchId, confirm: expected }) });
+      setRecoveryReview(undefined); await refreshHistorySafely();
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Publication recovery failed.'); }
+    finally { setBusy(false); }
+  }
   async function verifyAbandonment(operation: PublicationOperation) {
     setBusy(true); setError(''); setAbandonReview(undefined);
     try {
@@ -207,13 +227,14 @@ function PublishingPanel({ batch, product }: { batch?: MockupBatch; product?: Sh
   }
   return <section className={`panel ${status.enabled ? '' : 'disabled'}`}><div className="section-number">05</div><div className="section-heading"><div><h2>Publishing and Rollback</h2><p>Explicitly validate, approve, publish, and restore a completed batch.</p></div><span className={status.enabled ? 'local' : 'future'}>{status.enabled ? 'Server enabled' : 'Disabled by default'}</span></div>
     {!status.enabled && <div className="notice">{status.reason ?? 'Publishing is disabled.'}</div>}
-    <div className="publish-auth"><input type="password" autoComplete="off" placeholder="Local publishing authorization" value={authorization} onChange={(event) => setAuthorization(event.target.value)} disabled={!status.enabled}/><button disabled={!status.enabled || !authorization || !batch || busy} onClick={() => void validate()}>Validate readiness</button></div>
+    <div className="publish-auth"><input type="password" autoComplete="off" placeholder="Local publishing authorization" value={authorization} onChange={(event) => setAuthorization(event.target.value)} disabled={!status.enabled}/><button disabled={!status.enabled || !authorization || busy} onClick={() => void refreshHistorySafely()}>Load publication history</button><button disabled={!status.enabled || !authorization || !batch || busy} onClick={() => void validate()}>Validate new publication</button></div>
     {error && <div className="error">{error}</div>}
     {historyError && <div className="notice" role="status">Publication history could not be refreshed: {historyError}</div>}
+    {recoveryReview && <div className={recoveryReview.readiness.eligible ? 'notice' : 'error'}><strong>Recovery verification: {recoveryReview.operation.id}</strong>{recoveryReview.readiness.eligible ? <><p>{recoveryReview.readiness.imageCount} image records and {recoveryReview.readiness.variantCount} variant mappings are consistent with the immutable operation. Original product media is preserved.</p><button className="primary" disabled={busy} onClick={() => void resumeSelected()}>Resume Publication</button></> : <p>{recoveryReview.readiness.errors.join(' ')}</p>}</div>}
     {abandonReview && <div className={abandonReview.readiness.eligible ? 'notice' : 'error'}><strong>Abandonment verification: {abandonReview.operation.id}</strong>{abandonReview.readiness.eligible ? <><p>Live product media order and all original variant associations match the immutable snapshot. No generated media from this operation remains attached.</p><button disabled={busy} onClick={() => void abandonSelected()}>Abandon Partial Operation</button></> : <p>{abandonReview.readiness.errors.join(' ')}</p>}</div>}
     {readiness && <div className={readiness.ready ? 'success' : 'error'}>{readiness.ready ? `${readiness.imageCount} images and ${readiness.variantCount} variants are ready.` : readiness.errors.join(' ')}</div>}
     {readiness?.ready && batch && <><div className="publish-review">{readiness.colors.map((entry) => { const item = batch.items.find((candidate) => candidate.color === entry.color); const before = product?.images.find((image) => image.id === item?.sourceImageId); return <article key={entry.color}><h3>{entry.color}</h3><div><figure><figcaption>Before</figcaption>{before ? <img src={before.url} alt="Original Shopify source"/> : <span>Unavailable</span>}</figure><figure><figcaption>After</figcaption>{item?.preview ? <img src={assetUrl(item.preview)} alt="Generated preview"/> : <span>Unavailable</span>}</figure></div><p>{entry.variantCount} variants affected</p></article>; })}</div><button className="primary" disabled={busy} onClick={() => void publish()}>{busy ? 'Operation in progress…' : 'Publish All'}</button></>}
-    {history.length > 0 && <div className="publication-history"><h3>Publication history</h3>{history.map((operation) => <article key={operation.id}><div><strong>{operation.productTitle}</strong><span>{operation.status}</span><small>{new Date(operation.updatedAt).toLocaleString()}</small></div><div>{operation.items.map((item) => <span key={item.color}>{item.color}: {item.status}</span>)}</div>{['published','partial','rollback_partial','conflict'].includes(operation.status) && <button disabled={busy} onClick={() => void rollback(operation)}>Restore Original Images</button>}{operation.productId === abandonmentTestProductId && ['partial','rollback_partial','conflict'].includes(operation.status) && <button disabled={busy} onClick={() => void verifyAbandonment(operation)}>Verify for Abandonment</button>}{operation.status === 'abandoned' && <small>Abandoned {operation.abandonedAt ? new Date(operation.abandonedAt).toLocaleString() : ''}: {operation.abandonmentReason}</small>}</article>)}</div>}
+    {history.length > 0 && <div className="publication-history"><h3>Publication history</h3>{history.map((operation) => <article key={operation.id}><div><strong>{operation.productTitle}</strong><span>{operation.status}</span><small>{new Date(operation.updatedAt).toLocaleString()}</small></div><div>{operation.items.map((item) => <span key={item.color}>{item.color}: {item.status}</span>)}</div>{operation.status === 'partial' && <button disabled={busy} onClick={() => void verifyRecovery(operation)}>Check Recovery</button>}{['published','partial','rollback_partial','conflict'].includes(operation.status) && <button disabled={busy} onClick={() => void rollback(operation)}>Restore Original Images</button>}{operation.productId === abandonmentTestProductId && ['partial','rollback_partial','conflict'].includes(operation.status) && <button disabled={busy} onClick={() => void verifyAbandonment(operation)}>Verify for Abandonment</button>}{operation.status === 'abandoned' && <small>Abandoned {operation.abandonedAt ? new Date(operation.abandonedAt).toLocaleString() : ''}: {operation.abandonmentReason}</small>}</article>)}</div>}
   </section>;
 }
 

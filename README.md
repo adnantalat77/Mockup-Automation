@@ -68,6 +68,8 @@ Publishing remains unavailable unless all three server-side gates pass: `SHOPIFY
 
 Before publishing, the API completely paginates product media, variants, and each variant's media, validates every color-to-variant association and generated PNG, and writes checkpoint zero under ignored `data/publications/`. Every mutation has a preceding intent checkpoint and a following result checkpoint. Original media are retained. Partial retries reconcile the immutable snapshot against live Shopify state and stop on external drift or an uncertain file-creation result.
 
+New publication readiness and partial-operation recovery are separate workflows. **Publish All** only creates a new operation when no nonterminal operation blocks the product. An eligible `partial` history entry is checked using its immutable operation and batch IDs plus a complete live snapshot, then continued with **Resume Publication**. The resume endpoint cannot create a new operation and reconciles live state again before continuing.
+
 If startup finds a persisted `create_file` intent without a checkpointed Shopify media ID, the operation is marked as an uncertain-creation conflict. Neither restart recovery nor a partial-operation retry repeats `fileCreate`; manual reconciliation is required to locate and establish ownership of any file Shopify may have created.
 
 The Shopify workflow uses staged uploads, `fileCreate`, file-processing polling, `fileUpdate` product references, `productVariantsBulkUpdate`, `productVariantDetachMedia` for originally unassigned variants, `productReorderMedia`, and guarded `fileDelete`. It does not use deprecated `productDeleteMedia`. See [docs/PHASE4_LIVE_TEST.md](docs/PHASE4_LIVE_TEST.md) before any separately approved live test.

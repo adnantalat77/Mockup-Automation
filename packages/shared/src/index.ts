@@ -150,3 +150,14 @@ export interface PublishReadiness {
   colors: Array<{ color: string; variantCount: number; previewId: string }>;
   errors: string[];
 }
+
+export interface RecoveryReadiness {
+  eligible: boolean;
+  operationId: string;
+  batchId: string;
+  productId: string;
+  imageCount: number;
+  variantCount: number;
+  orderingComplete: boolean;
+  errors: string[];
+}

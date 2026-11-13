@@ -158,7 +158,7 @@ describe('PublishingService', () => {
     const stored = publishing.get(operation.id);
     stored.status = 'partial'; stored.expectedPublishedMediaOrder = [...stored.originalMediaOrder]; stored.completedSteps = [];
     stored.items[0].createdMediaId = undefined; stored.items[0].intent = 'create_file'; stored.items[0].status = 'pending';
-    await expect(publishing.publish(batch.id)).resolves.toMatchObject({ status: 'conflict' });
+    await expect(publishing.resume(operation.id, batch.id)).rejects.toBeInstanceOf(PublicationError);
     expect(api.createImageFile).toHaveBeenCalledOnce();
   });
 
@@ -167,9 +167,10 @@ describe('PublishingService', () => {
     api.replaceVariantMedia.mockRejectedValueOnce(new Error('temporary failure')).mockImplementation(async (_productId: string, mediaId: string, variantIds: string[]) => {
       for (const variant of live.variants) if (variantIds.includes(variant.id)) variant.mediaIds = [mediaId];
     });
-    await expect(publishing.publish(batch.id)).resolves.toMatchObject({ status: 'partial' });
+    const operation = await publishing.publish(batch.id);
+    expect(operation.status).toBe('partial');
     const partial = publishing.list()[0]; partial.items[0].intent = 'append_variants';
-    await expect(publishing.publish(batch.id)).resolves.toMatchObject({ status: 'published' });
+    await expect(publishing.resume(operation.id, batch.id)).resolves.toMatchObject({ status: 'published' });
     expect(api.createImageFile).toHaveBeenCalledOnce();
     expect(api.addFileToProduct).toHaveBeenCalledOnce();
   });
@@ -180,8 +181,9 @@ describe('PublishingService', () => {
       for (const variant of live.variants) if (variantIds.includes(variant.id)) variant.mediaIds = [mediaId];
       throw new Error('connection lost after replacement');
     });
-    await expect(publishing.publish(batch.id)).resolves.toMatchObject({ status: 'partial', items: [{ intent: 'replace_variants' }] });
-    await expect(publishing.publish(batch.id)).resolves.toMatchObject({ status: 'published' });
+    const operation = await publishing.publish(batch.id);
+    expect(operation).toMatchObject({ status: 'partial', items: [{ intent: 'replace_variants' }] });
+    await expect(publishing.resume(operation.id, batch.id)).resolves.toMatchObject({ status: 'published' });
     expect(api.replaceVariantMedia).toHaveBeenCalledOnce();
     expect(api.createImageFile).toHaveBeenCalledOnce();
   });
@@ -192,8 +194,9 @@ describe('PublishingService', () => {
       live.variants[0].mediaIds = [mediaId];
       throw new Error('partial state observed');
     });
-    await expect(publishing.publish(batch.id)).resolves.toMatchObject({ status: 'partial' });
-    await expect(publishing.publish(batch.id)).resolves.toMatchObject({ status: 'conflict' });
+    const operation = await publishing.publish(batch.id);
+    expect(operation.status).toBe('partial');
+    await expect(publishing.resume(operation.id, batch.id)).resolves.toMatchObject({ status: 'conflict' });
     expect(api.replaceVariantMedia).toHaveBeenCalledOnce();
   });
 
@@ -212,38 +215,70 @@ describe('PublishingService', () => {
   it('safely retries failures before staging and product-reference mutation boundaries', async () => {
     const { batch, publishing, api, live } = await fixture();
     api.stageImage.mockRejectedValueOnce(new Error('staging unavailable')).mockResolvedValue('https://staged.example/image');
-    await expect(publishing.publish(batch.id)).resolves.toMatchObject({ status: 'partial' });
+    const operation = await publishing.publish(batch.id);
+    expect(operation.status).toBe('partial');
     api.addFileToProduct.mockRejectedValueOnce(new Error('reference unavailable')).mockImplementation(async (id: string) => { if (!live.mediaIds.includes(id)) live.mediaIds.push(id); });
-    await expect(publishing.publish(batch.id)).resolves.toMatchObject({ status: 'partial' });
-    await expect(publishing.publish(batch.id)).resolves.toMatchObject({ status: 'published' });
+    await expect(publishing.resume(operation.id, batch.id)).resolves.toMatchObject({ status: 'partial' });
+    await expect(publishing.resume(operation.id, batch.id)).resolves.toMatchObject({ status: 'published' });
     expect(api.createImageFile).toHaveBeenCalledOnce();
   });
 
   it('reconciles an asynchronously completed reorder without repeating it', async () => {
     const { batch, publishing, api, live } = await fixture();
     api.reorderMedia.mockRejectedValueOnce(new Error('order job unavailable')).mockImplementation(async (_id: string, ids: string[]) => { live.mediaIds = [...ids]; });
-    await expect(publishing.publish(batch.id)).resolves.toMatchObject({ status: 'partial' });
-    await expect(publishing.publish(batch.id)).resolves.toMatchObject({ status: 'published' });
+    const operation = await publishing.publish(batch.id);
+    expect(operation.status).toBe('partial');
+    await expect(publishing.resume(operation.id, batch.id)).resolves.toMatchObject({ status: 'published' });
     expect(api.createImageFile).toHaveBeenCalledOnce();
     expect(api.replaceVariantMedia).toHaveBeenCalledOnce();
     expect(api.reorderMedia).toHaveBeenCalledOnce();
+  });
+
+  it('validates an existing partial operation separately and resumes it without creating a duplicate operation', async () => {
+    const { batch, publishing, api } = await fixture();
+    api.reorderMedia.mockRejectedValueOnce(new Error('order job unavailable'));
+    const operation = await publishing.publish(batch.id);
+
+    await expect(publishing.validate(batch.id)).resolves.toMatchObject({ ready: false, errors: [expect.stringContaining(operation.id)] });
+    await expect(publishing.validateRecovery(operation.id, batch.id)).resolves.toMatchObject({
+      eligible: true, operationId: operation.id, batchId: batch.id, imageCount: 1, variantCount: 2
+    });
+    await expect(publishing.publish(batch.id)).rejects.toBeInstanceOf(PublicationError);
+    await expect(publishing.resume(operation.id, batch.id)).resolves.toMatchObject({ status: 'published', id: operation.id });
+    expect(publishing.list()).toHaveLength(1);
+    await expect(publishing.resume(operation.id, batch.id)).rejects.toBeInstanceOf(PublicationError);
+    expect(api.createImageFile).toHaveBeenCalledOnce();
+    expect(api.replaceVariantMedia).toHaveBeenCalledOnce();
+  });
+
+  it('rejects recovery readiness for the wrong batch and for an abandoned operation', async () => {
+    const { batch, publishing, api } = await fixture();
+    api.reorderMedia.mockRejectedValueOnce(new Error('order job unavailable'));
+    const operation = await publishing.publish(batch.id);
+    const wrongBatch = '00000000-0000-4000-8000-000000000000';
+    await expect(publishing.validateRecovery(operation.id, wrongBatch)).resolves.toMatchObject({ eligible: false, errors: [expect.stringMatching(/batch/i)] });
+    publishing.get(operation.id).status = 'abandoned';
+    await expect(publishing.validateRecovery(operation.id, batch.id)).resolves.toMatchObject({ eligible: false, errors: [expect.stringMatching(/abandoned/i)] });
   });
 
   it('safely retries an interrupted reorder when live ordering has not completed', async () => {
     const { batch, publishing, api, live } = await fixture();
     api.reorderMedia.mockImplementationOnce(async () => { live.mediaIds = ['gid://shopify/MediaImage/99', 'gid://shopify/MediaImage/50']; throw new Error('job polling failed'); })
       .mockImplementation(async (_id: string, ids: string[]) => { live.mediaIds = [...ids]; });
-    await expect(publishing.publish(batch.id)).resolves.toMatchObject({ status: 'partial', items: [{ intent: 'reorder_published' }] });
-    await expect(publishing.publish(batch.id)).resolves.toMatchObject({ status: 'published' });
+    const operation = await publishing.publish(batch.id);
+    expect(operation).toMatchObject({ status: 'partial', items: [{ intent: 'reorder_published' }] });
+    await expect(publishing.resume(operation.id, batch.id)).resolves.toMatchObject({ status: 'published' });
     expect(api.createImageFile).toHaveBeenCalledOnce(); expect(api.replaceVariantMedia).toHaveBeenCalledOnce(); expect(api.reorderMedia).toHaveBeenCalledTimes(2);
   });
 
   it('fails closed on unexpected media while reconciling interrupted reordering', async () => {
     const { batch, publishing, api, live } = await fixture();
     api.reorderMedia.mockRejectedValueOnce(new Error('job polling failed'));
-    await expect(publishing.publish(batch.id)).resolves.toMatchObject({ status: 'partial' });
+    const operation = await publishing.publish(batch.id);
+    expect(operation.status).toBe('partial');
     live.mediaIds.push('gid://shopify/MediaImage/777');
-    await expect(publishing.publish(batch.id)).resolves.toMatchObject({ status: 'conflict' });
+    await expect(publishing.validateRecovery(operation.id, batch.id)).resolves.toMatchObject({ eligible: false, errors: [expect.stringMatching(/externally/i)] });
+    await expect(publishing.resume(operation.id, batch.id)).rejects.toBeInstanceOf(PublicationError);
     expect(api.reorderMedia).toHaveBeenCalledOnce(); expect(api.createImageFile).toHaveBeenCalledOnce(); expect(api.replaceVariantMedia).toHaveBeenCalledOnce();
   });
 

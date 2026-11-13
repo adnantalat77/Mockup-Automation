@@ -156,6 +156,21 @@ export async function createApp(overrides: Partial<AppConfig> = {}) {
     } catch (error) { next(error); }
   });
 
+  app.post('/api/publishing/:id/recovery/validate', async (request, response, next) => {
+    try {
+      authorizePublishing(request); await verifyPublishingScopes();
+      response.json(await publishing!.validateRecovery(request.params.id, String(request.body?.batchId ?? '')));
+    } catch (error) { next(error); }
+  });
+
+  app.post('/api/publishing/:id/resume', async (request, response, next) => {
+    try {
+      authorizePublishing(request); await verifyPublishingScopes();
+      if (request.body?.confirm !== `RESUME ${request.params.id}`) throw new PublicationError('Explicit recovery confirmation with the operation ID is required.', 400);
+      response.json(await publishing!.resume(request.params.id, String(request.body?.batchId ?? '')));
+    } catch (error) { next(error); }
+  });
+
   app.get('/api/publishing/operations', async (request, response, next) => {
     try { authorizePublishing(request, false); await verifyPublishingScopes(); response.json(publishing!.list()); }
     catch (error) { next(error); }

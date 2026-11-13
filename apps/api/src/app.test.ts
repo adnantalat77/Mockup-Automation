@@ -4,7 +4,7 @@ import path from 'node:path';
 import sharp from 'sharp';
 import request from 'supertest';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { createApp } from './app.js';
+import { createApp, isPublishingOriginAllowed } from './app.js';
 import { analyzeTransparency, compositePreview, hasTransparentPixels } from './services/images.js';
 
 let dataDir: string;
@@ -131,8 +131,23 @@ describe('compositing', () => {
 });
 
 describe('publishing authorization', () => {
+  it('allows an authenticated read-only history request without Origin but still requires Origin for mutations', () => {
+    expect(isPublishingOriginAllowed(undefined, 'http://127.0.0.1:3000', false)).toBe(true);
+    expect(isPublishingOriginAllowed(undefined, 'http://127.0.0.1:3000', true)).toBe(false);
+    expect(isPublishingOriginAllowed('https://attacker.example', 'http://127.0.0.1:3000', false)).toBe(false);
+  });
+
   it('rejects publication while the server feature flag is disabled', async () => {
     const response = await request(app).post('/api/publishing/publish').set('Origin', 'http://127.0.0.1:3000').set('X-Publish-Authorization', 'not-authorized').send({ batchId: '00000000-0000-4000-8000-000000000000', confirm: 'PUBLISH' });
     expect(response.status).toBe(403);
+  });
+
+  it('protects rollback finalization verification and mutation routes while publishing is disabled', async () => {
+    const id = '00000000-0000-4000-8000-000000000000';
+    const headers = { Origin: 'http://127.0.0.1:3000', 'X-Publish-Authorization': 'not-authorized' };
+    const verification = await request(app).post(`/api/publishing/${id}/rollback-finalization/validate`).set(headers).send({});
+    const finalization = await request(app).post(`/api/publishing/${id}/rollback-finalization`).set(headers).send({ confirm: `FINALIZE ${id} FILES RETAINED` });
+    expect(verification.status).toBe(403); expect(finalization.status).toBe(403);
+    expect(isPublishingOriginAllowed('https://attacker.example', 'http://127.0.0.1:3000', true)).toBe(false);
   });
 });

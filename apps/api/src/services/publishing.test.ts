@@ -59,6 +59,18 @@ async function restoredPartialFixture() {
   return { ...result, operation };
 }
 
+async function retainedRollbackFixture() {
+  const result = await fixture();
+  const published = await result.publishing.publish(result.batch.id);
+  result.api.verifyFileDeletionSafe.mockResolvedValueOnce({ safe: false, reason: 'global references cannot be proven exclusive' });
+  const operation = await result.publishing.rollback(published.id);
+  expect(operation).toMatchObject({ status: 'conflict', productRestored: true, items: [{ status: 'rolled_back', cleanupPending: true }] });
+  vi.clearAllMocks();
+  result.api.getProduct.mockResolvedValue(product);
+  result.api.getPublicationState.mockImplementation(async () => structuredClone(result.live));
+  return { ...result, operation };
+}
+
 describe('PublishingService', () => {
   it('validates and publishes all size variants for a color', async () => {
     const { batch, api, publishing } = await fixture();
@@ -298,6 +310,65 @@ describe('PublishingService', () => {
       status: 'conflict', productRestored: true, cleanupConflicts: [expect.stringContaining('generated file was preserved')]
     });
     expect(api.deleteFile).not.toHaveBeenCalled();
+  });
+
+  it('verifies and finalizes a restored product while retaining generated files without Shopify mutations', async () => {
+    const { root, operation, publishing, api } = await retainedRollbackFixture();
+    const readiness = await publishing.validateRollbackFinalization(operation.id);
+    expect(readiness).toMatchObject({ eligible: true, retainedFileCount: 1, evidence: {
+      snapshotComplete: true, originalMediaIdsVerified: ['gid://shopify/MediaImage/50'], retainedGeneratedMediaIds: ['gid://shopify/MediaImage/99']
+    } });
+    expect(readiness.evidence?.originalVariantAssociationsVerified).toEqual(product.variants.map((variant) => ({ variantId: variant.id, mediaIds: ['gid://shopify/MediaImage/50'] })));
+    const before = (await readdir(path.join(root, 'publications', operation.id))).filter((name) => name.endsWith('.json')).length;
+    const confirmation = `FINALIZE ${operation.id} FILES RETAINED`;
+    const finalized = await publishing.finalizeRollback(operation.id, confirmation);
+    expect(finalized).toMatchObject({ status: 'rolled_back_files_retained', rollbackFinalizationEvidence: {
+      previousStatus: 'conflict', newStatus: 'rolled_back_files_retained', confirmation,
+      cleanupReason: 'global_file_deletion_ownership_unproven', retainedGeneratedMediaIds: ['gid://shopify/MediaImage/99']
+    }, items: [{ cleanupPending: false, cleanupDisposition: 'retained_manual_ownership_review' }] });
+    expect((await readdir(path.join(root, 'publications', operation.id))).filter((name) => name.endsWith('.json'))).toHaveLength(before + 1);
+    expect(api.stageImage).not.toHaveBeenCalled(); expect(api.createImageFile).not.toHaveBeenCalled(); expect(api.addFileToProduct).not.toHaveBeenCalled();
+    expect(api.replaceVariantMedia).not.toHaveBeenCalled(); expect(api.removeFileFromProduct).not.toHaveBeenCalled(); expect(api.deleteFile).not.toHaveBeenCalled(); expect(api.reorderMedia).not.toHaveBeenCalled();
+    await expect(publishing.finalizeRollback(operation.id, confirmation)).rejects.toBeInstanceOf(PublicationError);
+  });
+
+  it('requires the exact operation-specific retained-files confirmation', async () => {
+    const { operation, publishing, api } = await retainedRollbackFixture();
+    await expect(publishing.finalizeRollback(operation.id, 'FINALIZE')).rejects.toBeInstanceOf(PublicationError);
+    expect(api.getPublicationState).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['missing original media', (state: any) => { state.mediaIds = []; }, /media IDs or ordering/],
+    ['unexpected extra media', (state: any) => { state.mediaIds.push('gid://shopify/MediaImage/777'); }, /media IDs or ordering/],
+    ['missing variant', (state: any) => { state.variants.pop(); }, /variant set|missing/],
+    ['unexpected variant', (state: any) => { state.variants.push({ id: 'gid://shopify/ProductVariant/777', mediaIds: [] }); }, /variant set|unexpected/],
+    ['changed variant association', (state: any) => { state.variants[0].mediaIds = []; }, /association/],
+    ['incomplete pagination', (state: any) => { state.complete = false; }, /incomplete/]
+  ])('rejects rollback finalization when live state has %s', async (_name, mutate, message) => {
+    const { operation, publishing, api, live } = await retainedRollbackFixture();
+    const changed = structuredClone(live); mutate(changed); api.getPublicationState.mockResolvedValueOnce(changed);
+    const readiness = await publishing.validateRollbackFinalization(operation.id);
+    expect(readiness.eligible).toBe(false); expect(readiness.errors.join(' ')).toMatch(message);
+  });
+
+  it('rejects missing cleanup evidence and unrelated operation errors without reading Shopify', async () => {
+    const missing = await retainedRollbackFixture(); missing.publishing.get(missing.operation.id).items[0].cleanupPending = false;
+    expect((await missing.publishing.validateRollbackFinalization(missing.operation.id)).errors.join(' ')).toMatch(/cleanup-pending/);
+    expect(missing.api.getPublicationState).not.toHaveBeenCalled();
+    const unrelated = await retainedRollbackFixture(); unrelated.publishing.get(unrelated.operation.id).errors.push('Unrelated restoration failure');
+    expect((await unrelated.publishing.validateRollbackFinalization(unrelated.operation.id)).errors.join(' ')).toMatch(/beyond/);
+    expect(unrelated.api.getPublicationState).not.toHaveBeenCalled();
+  });
+
+  it('serializes finalization and allows future publication readiness only after terminal finalization', async () => {
+    const { operation, publishing, api, batch } = await retainedRollbackFixture();
+    await expect(publishing.validate(batch.id)).resolves.toMatchObject({ ready: false });
+    api.getPublicationState.mockImplementation(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); return structuredClone({ complete: true, mediaIds: ['gid://shopify/MediaImage/50'], variants: product.variants.map((variant) => ({ id: variant.id, color: variant.color, mediaIds: ['gid://shopify/MediaImage/50'] })) }); });
+    const confirmation = `FINALIZE ${operation.id} FILES RETAINED`;
+    const [first, second] = await Promise.allSettled([publishing.finalizeRollback(operation.id, confirmation), publishing.finalizeRollback(operation.id, confirmation)]);
+    expect([first.status, second.status].sort()).toEqual(['fulfilled', 'rejected']);
+    await expect(publishing.validate(batch.id)).resolves.toMatchObject({ ready: true });
   });
 
   it('recovers from the latest complete checkpoint when a newer file is incomplete', async () => {

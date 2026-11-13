@@ -198,6 +198,20 @@ export async function createApp(overrides: Partial<AppConfig> = {}) {
     } catch (error) { next(error); }
   });
 
+  app.post('/api/publishing/:id/rollback-finalization/validate', async (request, response, next) => {
+    try { authorizePublishing(request); await verifyPublishingScopes(); response.json(await publishing!.validateRollbackFinalization(request.params.id)); }
+    catch (error) { next(error); }
+  });
+
+  app.post('/api/publishing/:id/rollback-finalization', async (request, response, next) => {
+    try {
+      authorizePublishing(request); await verifyPublishingScopes();
+      const expected = `FINALIZE ${request.params.id} FILES RETAINED`;
+      if (request.body?.confirm !== expected) throw new PublicationError('Explicit retained-files finalization confirmation with the operation ID is required.', 400);
+      response.json(await publishing!.finalizeRollback(request.params.id, expected));
+    } catch (error) { next(error); }
+  });
+
   app.post('/api/backgrounds', upload.single('image'), async (request, response, next) => {
     try {
       if (!request.file) throw new ImageValidationError('Choose a JPEG or PNG background.');

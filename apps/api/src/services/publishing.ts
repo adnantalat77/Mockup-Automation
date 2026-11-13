@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { mkdir, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import type { AbandonReadiness, AbandonmentEvidence, MockupBatch, PublicationItem, PublicationOperation, PublishReadiness, RecoveryReadiness } from '@mockup-automation/shared';
+import type { AbandonReadiness, AbandonmentEvidence, MockupBatch, PublicationItem, PublicationOperation, PublishReadiness, RecoveryReadiness, RollbackFinalizationEvidence, RollbackFinalizationReadiness } from '@mockup-automation/shared';
 import { inspectImage } from './images.js';
 import { AssetStore } from './storage.js';
 import { BatchService } from './batches.js';
@@ -11,7 +11,7 @@ const STRICT_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}
 const STEP = (kind: string, color: string) => `${kind}:${color}`;
 export const ABANDONMENT_TEST_PRODUCT_ID = 'gid://shopify/Product/15608846975264';
 const ABANDONMENT_TEST_PRODUCT_TITLE = 'Mockup Automation - TEST ONLY';
-const TERMINAL_STATUSES = new Set(['rolled_back', 'abandoned']);
+const TERMINAL_STATUSES = new Set(['rolled_back', 'rolled_back_files_retained', 'abandoned']);
 type PublishingShopify = Pick<ShopifyService, 'getProduct' | 'getPublicationState' | 'stageImage' | 'createImageFile' | 'waitForFileReady' | 'addFileToProduct' | 'removeFileFromProduct' | 'replaceVariantMedia' | 'detachVariantMedia' | 'reorderMedia' | 'deleteFile' | 'verifyFileDeletionSafe'>;
 
 export class PublicationError extends Error { constructor(message: string, readonly status = 400) { super(message); } }
@@ -239,6 +239,81 @@ export class PublishingService {
       operation.abandonmentEvidence = readiness.evidence; operation.errors = [...operation.errors, `Operation abandoned after verified manual restoration: ${reason.trim()}`];
       await this.checkpoint(operation); return operation;
     });
+  }
+
+  async validateRollbackFinalization(operationId: string): Promise<RollbackFinalizationReadiness> {
+    return this.rollbackFinalizationReadiness(this.get(operationId));
+  }
+
+  async finalizeRollback(operationId: string, confirmation: string) {
+    const initial = this.get(operationId);
+    const expectedConfirmation = `FINALIZE ${operationId} FILES RETAINED`;
+    if (confirmation !== expectedConfirmation) throw new PublicationError('Explicit retained-files finalization confirmation with the operation ID is required.', 400);
+    return this.withLock(initial.productId, async () => {
+      const operation = this.get(operationId);
+      if (operation.status !== 'conflict') throw new PublicationError('This operation is no longer eligible for rollback finalization.', 409);
+      const readiness = await this.rollbackFinalizationReadiness(operation);
+      if (!readiness.eligible || !readiness.evidence) throw new PublicationError(readiness.errors.join(' '), 409);
+      const finalizedAt = new Date().toISOString();
+      operation.rollbackFinalizedAt = finalizedAt;
+      operation.rollbackFinalizationEvidence = { ...readiness.evidence, finalizedAt, previousStatus: 'conflict', newStatus: 'rolled_back_files_retained', confirmation };
+      for (const item of operation.items) { item.cleanupPending = false; item.cleanupDisposition = 'retained_manual_ownership_review'; }
+      operation.status = 'rolled_back_files_retained';
+      await this.checkpoint(operation);
+      return operation;
+    });
+  }
+
+  private async rollbackFinalizationReadiness(operation: PublicationOperation): Promise<RollbackFinalizationReadiness> {
+    const errors: string[] = [];
+    const generated = operation.items.map((item) => item.createdMediaId).filter((id): id is string => Boolean(id));
+    if (operation.status !== 'conflict') errors.push('Only a conflicted operation can be finalized.');
+    if (operation.productId !== ABANDONMENT_TEST_PRODUCT_ID || operation.productTitle !== ABANDONMENT_TEST_PRODUCT_TITLE) errors.push('Only the designated disposable test product is eligible.');
+    if (operation.productRestored !== true) errors.push('Product restoration has not been recorded as complete.');
+    if (!operation.items.length || operation.items.some((item) => item.status !== 'rolled_back')) errors.push('Every publication item must be rolled back.');
+    if (!generated.length || generated.length !== operation.items.length || new Set(generated).size !== generated.length) errors.push('Generated media ownership records are incomplete or inconsistent.');
+    if (operation.items.some((item) => !item.createdMediaId || item.cleanupPending !== true || item.error)) errors.push('Every retained generated file must have structured cleanup-pending evidence and no item error.');
+    if ((operation.cleanupConflicts?.length ?? 0) !== generated.length) errors.push('Generated-file cleanup conflict evidence is incomplete.');
+    if (operation.errors.length !== 1) errors.push('The operation contains unresolved errors beyond the retained-file cleanup outcome.');
+    if (!operation.completedSteps.includes('original-order-restored')) errors.push('Original media ordering was not checkpointed as restored.');
+    for (const item of operation.items) {
+      if (!operation.completedSteps.includes(STEP('removed-reference', item.color))) errors.push(`${item.color}: generated product reference removal was not checkpointed.`);
+      for (const variantId of item.variantIds) {
+        const original = operation.originalVariantMedia.find((entry) => entry.variantId === variantId)?.mediaIds;
+        if (!original) errors.push(`${item.color}: immutable variant ${variantId} is missing.`);
+        else if (original.length === 0 && !operation.completedSteps.includes(STEP('detached', item.color))) errors.push(`${item.color}: generated variant detachment was not checkpointed.`);
+        else if (original.length === 1 && !operation.completedSteps.includes(`restored-variants:${item.color}:${original[0]}`)) errors.push(`${item.color}: original variant restoration was not checkpointed.`);
+        else if (original.length > 1) errors.push(`${item.color}: immutable variant association is ambiguous.`);
+      }
+    }
+    const mediaSet = new Set(operation.originalMediaOrder); const variantIds = operation.originalVariantMedia.map((entry) => entry.variantId);
+    if (!operation.originalMediaOrder.length || mediaSet.size !== operation.originalMediaOrder.length) errors.push('Immutable original media snapshot is empty or contains duplicates.');
+    if (!variantIds.length || new Set(variantIds).size !== variantIds.length) errors.push('Immutable original variant snapshot is empty or contains duplicates.');
+    if (operation.originalVariantMedia.some((entry) => entry.mediaIds.some((id) => !mediaSet.has(id)))) errors.push('Immutable variant associations reference media outside the original snapshot.');
+    const mappedVariantIds = operation.items.flatMap((item) => item.variantIds);
+    if (mappedVariantIds.length !== variantIds.length || new Set(mappedVariantIds).size !== mappedVariantIds.length || variantIds.some((id) => !mappedVariantIds.includes(id))) errors.push('Immutable item-to-variant mapping is incomplete or inconsistent.');
+    if (errors.length) return { eligible: false, operationId: operation.id, productId: operation.productId, retainedFileCount: generated.length, errors };
+
+    const [product, state] = await Promise.all([this.shopify.getProduct(operation.productId, false), this.shopify.getPublicationState(operation.productId)]);
+    if (!state.complete) errors.push('Shopify returned an incomplete publication snapshot.');
+    if (product.id !== operation.productId || product.title !== ABANDONMENT_TEST_PRODUCT_TITLE || product.status.toUpperCase() !== 'DRAFT') errors.push('The live product identity does not match the designated disposable draft product.');
+    if (!same(state.mediaIds, operation.originalMediaOrder)) errors.push('Live product media IDs or ordering do not match the immutable original snapshot.');
+    if (state.variants.length !== operation.originalVariantMedia.length) errors.push('The live variant set does not match the immutable original snapshot.');
+    const originals = new Map(operation.originalVariantMedia.map((entry) => [entry.variantId, entry.mediaIds]));
+    for (const variant of state.variants) {
+      const original = originals.get(variant.id);
+      if (!original || !same(variant.mediaIds, original)) errors.push(`Variant ${variant.id} is unexpected or its media association does not match the immutable snapshot.`);
+    }
+    for (const original of operation.originalVariantMedia) if (!state.variants.some((variant) => variant.id === original.variantId)) errors.push(`Original variant ${original.variantId} is missing.`);
+    if (generated.some((id) => state.mediaIds.includes(id))) errors.push('Generated media remains attached to the product.');
+    if (state.variants.some((variant) => variant.mediaIds.some((id) => generated.includes(id)))) errors.push('Generated media remains associated with a variant.');
+    const evidence: RollbackFinalizationEvidence | undefined = errors.length ? undefined : {
+      verifiedAt: new Date().toISOString(), operationId: operation.id, productId: product.id, productTitle: product.title, productStatus: product.status,
+      snapshotComplete: true, originalMediaIdsVerified: [...state.mediaIds],
+      originalVariantAssociationsVerified: state.variants.map((variant) => ({ variantId: variant.id, mediaIds: [...variant.mediaIds] })),
+      retainedGeneratedMediaIds: [...generated], retainedFileConflicts: [...(operation.cleanupConflicts ?? [])], cleanupReason: 'global_file_deletion_ownership_unproven'
+    };
+    return { eligible: errors.length === 0, operationId: operation.id, productId: operation.productId, retainedFileCount: generated.length, errors, evidence };
   }
 
   private async abandonmentReadiness(operation: PublicationOperation): Promise<AbandonReadiness> {

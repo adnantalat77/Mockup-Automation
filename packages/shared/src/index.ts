@@ -84,7 +84,34 @@ export interface MockupBatch {
   counts: { total: number; queued: number; processing: number; success: number; failed: number; skipped: number; cancelled: number };
 }
 
-export type PublicationStatus = 'validated' | 'publishing' | 'published' | 'partial' | 'rolling_back' | 'rolled_back' | 'rollback_partial' | 'conflict' | 'abandoned';
+export type PublicationStatus = 'validated' | 'publishing' | 'published' | 'partial' | 'rolling_back' | 'rolled_back' | 'rolled_back_files_retained' | 'rollback_partial' | 'conflict' | 'abandoned';
+
+export interface RollbackFinalizationEvidence {
+  verifiedAt: string;
+  finalizedAt?: string;
+  operationId: string;
+  productId: string;
+  productTitle: string;
+  productStatus: string;
+  snapshotComplete: true;
+  originalMediaIdsVerified: string[];
+  originalVariantAssociationsVerified: Array<{ variantId: string; mediaIds: string[] }>;
+  retainedGeneratedMediaIds: string[];
+  retainedFileConflicts: string[];
+  cleanupReason: 'global_file_deletion_ownership_unproven';
+  previousStatus?: 'conflict';
+  newStatus?: 'rolled_back_files_retained';
+  confirmation?: string;
+}
+
+export interface RollbackFinalizationReadiness {
+  eligible: boolean;
+  operationId: string;
+  productId: string;
+  retainedFileCount: number;
+  errors: string[];
+  evidence?: RollbackFinalizationEvidence;
+}
 
 export interface AbandonmentEvidence {
   verifiedAt: string;
@@ -115,6 +142,7 @@ export interface PublicationItem {
   intent?: 'stage_upload' | 'create_file' | 'add_product_reference' | 'append_variants' | 'replace_variants' | 'restore_variants' | 'reorder_published' | 'detach_variants' | 'remove_product_reference' | 'delete_file' | 'restore_order';
   uncertainCreation?: boolean;
   cleanupPending?: boolean;
+  cleanupDisposition?: 'retained_manual_ownership_review';
   status: 'pending' | 'uploaded' | 'associated' | 'failed' | 'rolled_back';
   error?: string;
 }
@@ -139,6 +167,8 @@ export interface PublicationOperation {
   abandonedAt?: string;
   abandonmentReason?: string;
   abandonmentEvidence?: AbandonmentEvidence;
+  rollbackFinalizedAt?: string;
+  rollbackFinalizationEvidence?: RollbackFinalizationEvidence;
 }
 
 export interface PublishReadiness {

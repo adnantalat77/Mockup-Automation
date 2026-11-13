@@ -163,7 +163,8 @@ export class ShopifyService {
           validationMessage = error instanceof Error ? error.message : 'Image validation failed.';
         }
       }
-      images.push({ id: image.id, url: image.url, altText: image.altText ?? undefined, width: image.width ?? undefined, height: image.height ?? undefined, associatedColors: [...colors], association, validation, validationMessage });
+      const mediaId = [...aliases].find((id) => id.startsWith('gid://shopify/MediaImage/'));
+      images.push({ id: image.id, mediaId, url: image.url, altText: image.altText ?? undefined, width: image.width ?? undefined, height: image.height ?? undefined, associatedColors: [...colors], association, validation, validationMessage });
     }
     const colors = [...new Set(variants.map((variant) => variant.color).filter((value): value is string => Boolean(value)))];
     const sizes = [...new Set(variants.map((variant) => variant.size).filter((value): value is string => Boolean(value)))];
@@ -176,10 +177,12 @@ export class ShopifyService {
     const product = await this.getProduct(productId, false);
     const image = product.images.find((candidate) => candidate.id === imageId);
     if (!image) throw new ShopifyError('The requested image is not associated with this product.', 404, 'NOT_FOUND');
+    if (image.association !== 'reliable' || image.associatedColors.length !== 1 || !image.mediaId) throw new ShopifyError('The selected image lacks one reliable color and MediaImage association.', 409, 'AMBIGUOUS_SOURCE');
     const buffer = await this.downloadImage(image.url);
     const info = await inspectImage(buffer, ['png', 'jpeg']);
     if (info.format !== 'png' || !(await analyzeTransparency(buffer)).isMeaningfullyTransparent) throw new ShopifyError('The selected Shopify image is not a transparent PNG garment source.', 400, 'INCOMPATIBLE_IMAGE');
-    return { buffer, info, originalName: `shopify-${imageId.split('/').at(-1)}.png` };
+    const url = new URL(image.url);
+    return { buffer, info, originalName: `shopify-${imageId.split('/').at(-1)}.png`, color: image.associatedColors[0], mediaId: image.mediaId, sourceReference: `${url.origin}${url.pathname}` };
   }
 
   async downloadImage(rawUrl: string): Promise<Buffer> {

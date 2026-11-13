@@ -1,7 +1,7 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import type { AssetKind, ImageAsset } from '@mockup-automation/shared';
+import type { AssetKind, GarmentSourceProvenance, ImageAsset } from '@mockup-automation/shared';
 
 type StoredAsset = Omit<ImageAsset, 'url'> & { filename: string };
 const STRICT_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -21,8 +21,17 @@ export class AssetStore {
     const id = crypto.randomUUID();
     const filename = `${id}.${extension}`;
     await writeFile(path.join(this.folder(kind), filename), buffer, { flag: 'wx' });
-    const record: StoredAsset = { id, kind, filename, ...metadata };
+    const record: StoredAsset = { id, kind, filename, sha256: crypto.createHash('sha256').update(buffer).digest('hex'), ...metadata };
     await writeFile(path.join(this.folder(kind), `${id}.json`), JSON.stringify(record), { flag: 'wx' });
+    return this.publicAsset(record);
+  }
+
+  async saveGarment(buffer: Buffer, metadata: Omit<StoredAsset, 'id' | 'kind' | 'filename' | 'provenance'>, source: Omit<GarmentSourceProvenance, 'assetId' | 'sha256'>) {
+    const id = crypto.randomUUID(); const filename = `${id}.png`; const sha256 = crypto.createHash('sha256').update(buffer).digest('hex');
+    const provenance: GarmentSourceProvenance = { ...source, assetId: id, sha256 };
+    const record: StoredAsset = { id, kind: 'garment', filename, sha256, provenance, ...metadata };
+    await writeFile(path.join(this.folder('garment'), filename), buffer, { flag: 'wx' });
+    await writeFile(path.join(this.folder('garment'), `${id}.json`), JSON.stringify(record), { flag: 'wx' });
     return this.publicAsset(record);
   }
 

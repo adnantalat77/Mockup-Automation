@@ -63,9 +63,10 @@ export async function createApp(overrides: Partial<AppConfig> = {}) {
     try {
       if (!shopify) throw new ShopifyError('Shopify is not configured.', 503, 'NOT_CONFIGURED');
       const imported = await shopify.importTransparentImage(String(request.body?.productId ?? ''), String(request.body?.imageId ?? ''));
-      const asset = await store.save('garment', imported.buffer, 'png', {
+      const acquiredAt = new Date().toISOString();
+      const asset = await store.saveGarment(imported.buffer, {
         originalName: imported.originalName, width: imported.info.width, height: imported.info.height, hasTransparency: true
-      });
+      }, { schemaVersion: 1, productId: String(request.body?.productId ?? ''), color: imported.color, mediaId: imported.mediaId, sourceReference: imported.sourceReference, acquiredAt, validatedAt: acquiredAt, width: imported.info.width, height: imported.info.height, transparency: { meaningful: true } });
       response.status(201).json(asset);
     } catch (error) { next(error); }
   });

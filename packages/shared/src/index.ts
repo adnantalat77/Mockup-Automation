@@ -8,6 +8,44 @@ export interface ImageAsset {
   height: number;
   url: string;
   hasTransparency?: boolean;
+  sha256?: string;
+  provenance?: GarmentSourceProvenance;
+}
+
+export type SourceFreshnessState = 'verified_current' | 'historical_unverified' | 'source_changed' | 'source_unavailable' | 'provenance_missing';
+
+export interface GarmentSourceProvenance {
+  schemaVersion: 1;
+  productId: string;
+  color: string;
+  mediaId: string;
+  sourceReference: string;
+  sha256: string;
+  assetId: string;
+  acquiredAt: string;
+  validatedAt: string;
+  width: number;
+  height: number;
+  transparency: { meaningful: true };
+}
+
+export interface SourceFreshnessEvidence {
+  state: SourceFreshnessState;
+  checkedAt: string;
+  reason: string;
+  currentMediaId?: string;
+  currentSha256?: string;
+  comparison?: 'matches_preserved' | 'source_changed' | 'not_comparable';
+}
+
+export interface MockupGenerationEvidence {
+  generatedAt: string;
+  sourceAssetId: string;
+  sourceSha256: string;
+  backgroundAssetId: string;
+  backgroundSha256: string;
+  previewAssetId: string;
+  previewSha256: string;
 }
 
 export interface ApiError { error: string; details?: string }
@@ -42,6 +80,7 @@ export type ShopifyImageValidation = 'transparent' | 'opaque' | 'unsupported' | 
 
 export interface ShopifyProductImage {
   id: string;
+  mediaId?: string;
   url: string;
   altText?: string;
   width?: number;
@@ -66,6 +105,9 @@ export interface MockupBatchItem {
   color: string;
   sourceImageId?: string;
   sourceAsset?: ImageAsset;
+  sourceProvenance?: GarmentSourceProvenance;
+  sourceFreshness?: SourceFreshnessEvidence;
+  generationEvidence?: MockupGenerationEvidence;
   status: BatchItemStatus;
   reason?: string;
   attempts: number;
@@ -149,6 +191,8 @@ export interface PublicationItem {
   color: string;
   previewId: string;
   variantIds: string[];
+  sourceProvenance?: GarmentSourceProvenance;
+  generationEvidence?: MockupGenerationEvidence;
   createdMediaId?: string;
   stagedResourceUrl?: string;
   intent?: 'stage_upload' | 'create_file' | 'add_product_reference' | 'append_variants' | 'replace_variants' | 'remove_original_reference' | 'restore_original_reference' | 'restore_variants' | 'reorder_published' | 'detach_variants' | 'remove_product_reference' | 'delete_file' | 'restore_order';
@@ -170,6 +214,7 @@ export interface PublicationOperation {
   updatedAt: string;
   status: PublicationStatus;
   publicationMode?: 'append_originals' | 'replace_gallery';
+  sourceValidationSchemaVersion?: 1;
   rollbackMode?: RollbackMode;
   predecessorOperationId?: string;
   originalMediaOrder: string[];
@@ -199,6 +244,7 @@ export interface PublishReadiness {
   confirmationText: string;
   replacesGallery: boolean;
   colors: Array<{ color: string; variantCount: number; previewId: string }>;
+  sourceFreshness?: Array<{ color: string; state: SourceFreshnessState; reason: string }>;
   errors: string[];
 }
 

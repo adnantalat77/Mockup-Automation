@@ -13,7 +13,7 @@ const STEP = (kind: string, color: string) => `${kind}:${color}`;
 export const ABANDONMENT_TEST_PRODUCT_ID = 'gid://shopify/Product/15608846975264';
 const ABANDONMENT_TEST_PRODUCT_TITLE = 'Mockup Automation - TEST ONLY';
 const NONBLOCKING_STATUSES = new Set(['published', 'rolled_back', 'rolled_back_files_retained', 'abandoned']);
-type PublishingShopify = Pick<ShopifyService, 'getProduct' | 'getPublicationState' | 'stageImage' | 'createImageFile' | 'waitForFileReady' | 'addFileToProduct' | 'removeFileFromProduct' | 'replaceVariantMedia' | 'detachVariantMedia' | 'reorderMedia'>;
+type PublishingShopify = Pick<ShopifyService, 'getProduct' | 'getPublicationState' | 'downloadImage' | 'stageImage' | 'createImageFile' | 'waitForFileReady' | 'addFileToProduct' | 'removeFileFromProduct' | 'replaceVariantMedia' | 'detachVariantMedia' | 'reorderMedia'>;
 
 export class PublicationError extends Error { constructor(message: string, readonly status = 400) { super(message); } }
 const same = (left: string[], right: string[]) => left.length === right.length && left.every((value, index) => value === right[index]);
@@ -63,14 +63,14 @@ export class PublishingService {
   list() { return [...this.records.values()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)); }
   get(id: string) { this.assertId(id); const operation = this.records.get(id); if (!operation) throw new PublicationError('Publication operation not found.', 404); return operation; }
   async validate(batchId: string): Promise<PublishReadiness> {
-    const { batch, state, errors, colors } = await this.preflight(batchId);
+    const { batch, state, errors, colors, sourceFreshness } = await this.preflight(batchId);
     const existing = this.list().find((operation) => operation.batchId === batchId);
     if (existing) errors.push(`Batch ${batchId} already has publication operation ${existing.id}; generate a new batch for another publication.`);
     const blocker = this.blockingOperation(batch.productId);
     if (blocker) errors.push(`Publication operation ${blocker.id} must be rolled back or abandoned before a fresh publication.`);
     return { ready: !errors.length, batchId, productId: batch.productId, imageCount: colors.length, variantCount: colors.reduce((sum, item) => sum + item.variantIds.length, 0),
       currentGalleryImageCount: state.mediaIds.length, expectedFinalGalleryImageCount: colors.length, confirmationText: this.publicationConfirmation(batch.productId), replacesGallery: true,
-      colors: colors.map(({ color, variantIds, previewId }) => ({ color, variantCount: variantIds.length, previewId })), errors };
+      colors: colors.map(({ color, variantIds, previewId }) => ({ color, variantCount: variantIds.length, previewId })), sourceFreshness, errors };
   }
 
   async publish(batchId: string, confirmation = 'PUBLISH') {
@@ -87,9 +87,9 @@ export class PublishingService {
       const predecessor = this.latestOperation(context.batch.productId);
       const now = new Date().toISOString();
       const operation: PublicationOperation = { id: crypto.randomUUID(), version: 1, batchId, productId: context.batch.productId, productTitle: context.batch.productTitle,
-        createdAt: now, updatedAt: now, status: 'validated', publicationMode: 'replace_gallery', predecessorOperationId: predecessor?.id,
+        createdAt: now, updatedAt: now, status: 'validated', publicationMode: 'replace_gallery', sourceValidationSchemaVersion: 1, predecessorOperationId: predecessor?.id,
         originalMediaOrder: [...context.state.mediaIds], originalVariantMedia: context.state.variants.map((v) => ({ variantId: v.id, mediaIds: [...v.mediaIds] })), expectedPublishedMediaOrder: [],
-        items: context.colors.map((item) => ({ color: item.color, previewId: item.previewId, variantIds: item.variantIds, status: 'pending' })), completedSteps: [], errors: [] };
+        items: context.colors.map((item) => { const batchItem = context.batch.items.find((candidate) => candidate.color === item.color)!; return { color: item.color, previewId: item.previewId, variantIds: item.variantIds, sourceProvenance: structuredClone(batchItem.sourceProvenance), generationEvidence: structuredClone(batchItem.generationEvidence), status: 'pending' }; }), completedSteps: [], errors: [] };
       this.records.set(operation.id, operation);
       try { await this.checkpoint(operation); } catch (error) { operation.status = 'conflict'; operation.errors.push('Initial publication checkpoint persistence failed; this process will not start another operation for the product.'); this.records.set(operation.id, structuredClone(operation)); throw error; }
       return this.continuePublication(operation, false, true);
@@ -105,6 +105,10 @@ export class PublishingService {
     if (!errors.length) {
       try { batch = await this.batches.get(batchId); } catch { errors.push('The operation batch metadata is unavailable.'); }
       if (batch && batch.productId !== operation.productId) errors.push('The batch product does not match the immutable publication operation.');
+      if (batch && operation.sourceValidationSchemaVersion === 1) {
+        const context = await this.preflight(batchId); errors.push(...context.errors.map((error) => `Recovery source validation: ${error}`));
+        errors.push(...this.recoverySourceErrors(operation, context.batch, context.colors));
+      }
     }
     const blocker = this.blockingOperation(operation.productId, operation.id);
     if (blocker) errors.push(`Publication operation ${blocker.id} also targets this product.`);
@@ -140,6 +144,11 @@ export class PublishingService {
       if (recovering) {
         operation = this.get(operation.id);
         if (operation.status !== 'partial') throw new PublicationError(`Operation ${operation.id} is no longer eligible for recovery.`, 409);
+        if (operation.sourceValidationSchemaVersion === 1) {
+          const context = await this.preflight(operation.batchId);
+          const sourceErrors = [...context.errors, ...this.recoverySourceErrors(operation, context.batch, context.colors)];
+          if (sourceErrors.length) throw new PublicationError(`Recovery source validation failed: ${sourceErrors.join(' ')}`, 409);
+        }
         const conflict = await this.reconcilePublication(operation); if (conflict) return this.markConflict(operation, conflict);
       }
       operation.status = 'publishing'; operation.errors = []; await this.checkpoint(operation);
@@ -148,6 +157,7 @@ export class PublishingService {
         if (item.uncertainCreation || (item.intent === 'create_file' && !item.createdMediaId)) return this.markConflict(operation!, `${item.color}: file creation result is uncertain and cannot be safely retried.`);
         try {
           const bytes = (await this.assets.bytes('preview', item.previewId)).buffer;
+          if (operation.sourceValidationSchemaVersion === 1 && (!item.generationEvidence || item.generationEvidence.previewAssetId !== item.previewId || item.generationEvidence.previewSha256 !== this.hash(bytes))) return this.markConflict(operation, `${item.color}: preview bytes changed after final source validation; publication stopped before upload.`);
           const filename = `${operation.productTitle}-${item.color}.png`.replace(/[^a-z0-9._-]+/gi, '-');
           if (!item.stagedResourceUrl) { await this.intent(operation, item, 'stage_upload'); item.stagedResourceUrl = await this.shopify.stageImage(filename, bytes); item.intent = undefined; await this.checkpoint(operation); }
           if (!item.createdMediaId) {
@@ -493,18 +503,36 @@ export class PublishingService {
     if (!disposableTestProduct && !this.allowedProductIds.has(product.id)) errors.push('This Shopify product is not approved by the server-side publishing allowlist.');
     if (product.id !== batch.productId || product.title !== batch.productTitle) errors.push('The live Shopify product identity does not match the completed batch.');
     const colors: Array<{ color: string; variantIds: string[]; previewId: string }> = [];
+    const sourceFreshness: NonNullable<PublishReadiness['sourceFreshness']> = [];
     for (const item of batch.items) {
-      if (item.status !== 'success' || !item.preview || !item.sourceImageId) { errors.push(`${item.color}: generated preview or reliable source mapping is missing.`); continue; }
+      if (item.status !== 'success' || !item.preview || !item.sourceImageId) { errors.push(`${item.color}: generated preview or reliable source mapping is missing.`); sourceFreshness.push({ color: item.color, state: item.sourceFreshness?.state ?? 'provenance_missing', reason: item.reason ?? 'Generated preview or source mapping is missing.' }); continue; }
       const sourceImageId = item.sourceImageId; const variants = product.variants.filter((variant) => variant.color === item.color);
-      if (item.sourceAsset?.kind === 'garment') {
-        try { const sourceBytes = (await this.assets.bytes('garment', item.sourceAsset.id)).buffer; if (!(await analyzeTransparency(sourceBytes)).isMeaningfullyTransparent) throw new Error('opaque'); }
-        catch { errors.push(`${item.color}: preserved transparent garment source is missing or invalid.`); continue; }
-      } else {
-        const source = product.images.find((img) => img.id === sourceImageId && img.association === 'reliable' && img.associatedColors.length === 1 && img.associatedColors[0] === item.color);
-        if (!source || variants.some((variant) => !variant.associatedImageIds.includes(sourceImageId))) { errors.push(`${item.color}: current Shopify variant mapping conflicts with the batch source.`); continue; }
-      }
       if (!variants.length) { errors.push(`${item.color}: current Shopify variants no longer contain this color.`); continue; }
-      try { await inspectImage((await this.assets.bytes('preview', item.preview.id)).buffer, ['png']); } catch { errors.push(`${item.color}: generated preview file is missing or invalid.`); continue; }
+      const provenance = item.sourceProvenance; const generation = item.generationEvidence;
+      if (!provenance) { const reason = 'Source provenance is missing; historical cached artwork cannot establish current freshness.'; errors.push(`${item.color}: ${reason.toLowerCase()}`); sourceFreshness.push({ color: item.color, state: 'provenance_missing', reason }); continue; }
+      const assetProvenance = item.sourceAsset?.provenance;
+      if (provenance.schemaVersion !== 1 || provenance.productId !== batch.productId || provenance.color !== item.color || provenance.assetId !== item.sourceAsset?.id || !provenance.mediaId.startsWith('gid://shopify/MediaImage/') || !assetProvenance || assetProvenance.assetId !== provenance.assetId || assetProvenance.sha256 !== provenance.sha256 || assetProvenance.productId !== provenance.productId || assetProvenance.color !== provenance.color || assetProvenance.mediaId !== provenance.mediaId) { const reason = 'Source provenance is incomplete or does not match this product, color, and asset.'; errors.push(`${item.color}: ${reason.toLowerCase()}`); sourceFreshness.push({ color: item.color, state: 'provenance_missing', reason }); continue; }
+      let sourceBytes: Buffer; let backgroundBytes: Buffer; let previewBytes: Buffer;
+      try {
+        sourceBytes = (await this.assets.bytes('garment', provenance.assetId)).buffer;
+        backgroundBytes = (await this.assets.bytes('background', batch.backgroundId)).buffer;
+        previewBytes = (await this.assets.bytes('preview', item.preview.id)).buffer;
+        await inspectImage(previewBytes, ['png']);
+      } catch { const reason = 'Source, background, or preview asset is missing or invalid.'; errors.push(`${item.color}: ${reason.toLowerCase()}`); sourceFreshness.push({ color: item.color, state: 'source_unavailable', reason }); continue; }
+      const sourceHash = this.hash(sourceBytes); const backgroundHash = this.hash(backgroundBytes); const previewHash = this.hash(previewBytes);
+      if (sourceHash !== provenance.sha256 || (item.sourceAsset?.sha256 && item.sourceAsset.sha256 !== sourceHash)) { const reason = 'Preserved source bytes no longer match their recorded SHA-256 hash.'; errors.push(`${item.color}: ${reason.toLowerCase()}`); sourceFreshness.push({ color: item.color, state: 'source_changed', reason }); continue; }
+      if (!(await analyzeTransparency(sourceBytes)).isMeaningfullyTransparent) { const reason = 'Preserved garment source is no longer meaningfully transparent.'; errors.push(`${item.color}: ${reason.toLowerCase()}`); sourceFreshness.push({ color: item.color, state: 'source_changed', reason }); continue; }
+      if (!generation || generation.sourceAssetId !== provenance.assetId || generation.sourceSha256 !== sourceHash || generation.backgroundAssetId !== batch.backgroundId || generation.backgroundSha256 !== backgroundHash || generation.previewAssetId !== item.preview.id || generation.previewSha256 !== previewHash) { const reason = 'Preview/source/background hash evidence does not match the generated batch.'; errors.push(`${item.color}: ${reason.toLowerCase()}`); sourceFreshness.push({ color: item.color, state: 'source_changed', reason }); continue; }
+      const candidates = product.images.filter((image) => image.association === 'reliable' && image.associatedColors.length === 1 && image.associatedColors[0] === item.color);
+      if (candidates.length !== 1) { const reason = 'Shopify does not expose exactly one reliable current source; the cached source remains historical and unverified.'; errors.push(`${item.color}: ${reason}`); sourceFreshness.push({ color: item.color, state: candidates.length ? 'historical_unverified' : 'source_unavailable', reason }); continue; }
+      const current = candidates[0];
+      if (current.id !== sourceImageId || current.mediaId !== provenance.mediaId || variants.some((variant) => !variant.associatedImageIds.includes(current.id) && !variant.associatedImageIds.includes(provenance.mediaId))) { const reason = 'Current Shopify variant-to-color source mapping conflicts with the provenance record.'; errors.push(`${item.color}: ${reason.toLowerCase()}`); sourceFreshness.push({ color: item.color, state: 'source_changed', reason }); continue; }
+      try {
+        const currentBytes = await this.shopify.downloadImage(current.url); const info = await inspectImage(currentBytes, ['png']);
+        if (info.format !== 'png' || !(await analyzeTransparency(currentBytes)).isMeaningfullyTransparent) throw new Error('not a transparent PNG');
+        if (this.hash(currentBytes) !== provenance.sha256) { const reason = 'Current Shopify source artwork changed after batch generation.'; errors.push(`${item.color}: ${reason.toLowerCase()}`); sourceFreshness.push({ color: item.color, state: 'source_changed', reason }); continue; }
+      } catch (error) { const reason = `Current Shopify source is unavailable or invalid${error instanceof Error ? `: ${error.message}` : '.'}`; errors.push(`${item.color}: ${reason.toLowerCase()}`); sourceFreshness.push({ color: item.color, state: 'source_unavailable', reason }); continue; }
+      sourceFreshness.push({ color: item.color, state: 'verified_current', reason: 'Current Shopify source bytes and variant associations match the generated batch provenance.' });
       colors.push({ color: item.color, variantIds: variants.map((v) => v.id), previewId: item.preview.id });
     }
     const uniqueProductColors = new Set(product.variants.map((variant) => variant.color).filter((color): color is string => Boolean(color)));
@@ -516,7 +544,20 @@ export class PublishingService {
     const mappedVariantIds = colors.flatMap((item) => item.variantIds);
     if (mappedVariantIds.length !== product.variants.length || new Set(mappedVariantIds).size !== mappedVariantIds.length || product.variants.some((variant) => !mappedVariantIds.includes(variant.id))) errors.push('Every Shopify variant must map exactly once to its generated color image.');
     if (colors.some((item) => item.variantIds.length > 250)) errors.push('A color exceeds Shopify’s 250-item mutation input limit.');
-    return { batch, state, errors, colors };
+    return { batch, state, errors, colors, sourceFreshness };
+  }
+
+  private hash(buffer: Buffer) { return crypto.createHash('sha256').update(buffer).digest('hex'); }
+
+  private recoverySourceErrors(operation: PublicationOperation, batch: MockupBatch, colors: Array<{ color: string; variantIds: string[]; previewId: string }>) {
+    const errors: string[] = [];
+    for (const operationItem of operation.items) {
+      const batchItem = batch.items.find((item) => item.color === operationItem.color); const current = colors.find((item) => item.color === operationItem.color);
+      if (!batchItem || !current || current.previewId !== operationItem.previewId || batchItem.preview?.id !== operationItem.previewId) { errors.push(`${operationItem.color}: batch preview no longer matches the immutable publication operation.`); continue; }
+      if (!same(current.variantIds, operationItem.variantIds)) errors.push(`${operationItem.color}: current variant mapping no longer matches the immutable publication operation.`);
+      if (JSON.stringify(batchItem.sourceProvenance) !== JSON.stringify(operationItem.sourceProvenance) || JSON.stringify(batchItem.generationEvidence) !== JSON.stringify(operationItem.generationEvidence)) errors.push(`${operationItem.color}: source or generation evidence changed after publication started.`);
+    }
+    return errors;
   }
 
   private publicationConfirmation(productId: string) { return productId === ABANDONMENT_TEST_PRODUCT_ID ? 'PUBLISH' : `PUBLISH ${productId}`; }

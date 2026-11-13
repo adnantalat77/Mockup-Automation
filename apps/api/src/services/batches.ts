@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import sharp from 'sharp';
-import type { MockupBatch, MockupBatchItem, ShopifyProductDetail } from '@mockup-automation/shared';
+import type { GarmentSourceProvenance, MockupBatch, MockupBatchItem, ShopifyProductDetail } from '@mockup-automation/shared';
 import { AssetStore } from './storage.js';
 import { analyzeTransparency, compositePreview, inspectImage } from './images.js';
 import { ShopifyError, ShopifyService } from './shopify.js';
@@ -122,7 +122,11 @@ export class BatchService {
       if (item.status !== 'skipped' || !item.reason?.startsWith('No single compatible')) continue;
       const preserved = previous.flatMap((batch) => batch.items).find((candidate) => candidate.color === item.color && candidate.sourceImageId && candidate.sourceAsset?.kind === 'garment');
       if (!preserved?.sourceAsset || !preserved.sourceImageId) continue;
-      item.sourceImageId = preserved.sourceImageId; item.sourceAsset = preserved.sourceAsset; item.status = 'queued'; item.reason = undefined;
+      item.sourceImageId = preserved.sourceImageId; item.sourceAsset = preserved.sourceAsset; item.sourceProvenance = preserved.sourceProvenance;
+      item.sourceFreshness = preserved.sourceProvenance
+        ? { state: 'historical_unverified', checkedAt: new Date().toISOString(), reason: 'The preserved source is available locally, but Shopify no longer exposes one reliable current source for this color.', currentMediaId: preserved.sourceProvenance.mediaId, comparison: 'not_comparable' }
+        : { state: 'provenance_missing', checkedAt: new Date().toISOString(), reason: 'The preserved historical source predates structured provenance.' };
+      item.status = 'queued'; item.reason = undefined;
     }
     return items;
   }
@@ -162,20 +166,55 @@ export class BatchService {
     if (!item.sourceImageId) throw new BatchError('Source image is missing.');
     const background = await this.assets.bytes('background', batch.backgroundId);
     let garment: Buffer;
-    if (item.sourceAsset?.kind === 'garment') garment = (await this.assets.bytes('garment', item.sourceAsset.id)).buffer;
+    let acquiredSource: ShopifyProductDetail['images'][number] | undefined;
+    let currentComparison: 'matches_preserved' | 'source_changed' | 'not_comparable' = 'not_comparable';
+    if (item.sourceAsset?.kind === 'garment') {
+      garment = (await this.assets.bytes('garment', item.sourceAsset.id)).buffer;
+      const localHash = this.hash(garment);
+      if (!item.sourceProvenance) item.sourceFreshness = { state: 'provenance_missing', checkedAt: new Date().toISOString(), reason: 'The preserved historical source has no provenance record.' };
+      else if (item.sourceProvenance.assetId !== item.sourceAsset.id || item.sourceProvenance.sha256 !== localHash) throw new BatchError('The preserved garment source no longer matches its provenance hash.');
+      else item.sourceFreshness = { state: 'historical_unverified', checkedAt: new Date().toISOString(), reason: 'Local bytes match acquisition provenance, but current Shopify artwork cannot be independently verified.', currentMediaId: item.sourceProvenance.mediaId, currentSha256: localHash, comparison: 'not_comparable' };
+    }
     else {
       const product = await this.shopify.getProduct(batch.productId, false);
-      const source = product.images.find((image) => image.id === item.sourceImageId);
+      const source = product.images.find((image) => image.id === item.sourceImageId && image.association === 'reliable' && image.associatedColors.length === 1 && image.associatedColors[0] === item.color);
       if (!source) throw new BatchError('The mapped Shopify source image is no longer available.');
-      garment = await this.shopify.downloadImage(source.url);
+      if (!source.mediaId) throw new BatchError('The mapped Shopify source lacks a stable MediaImage identity.');
+      const variants = product.variants.filter((variant) => variant.color === item.color);
+      if (!variants.length || variants.some((variant) => !variant.associatedImageIds.includes(source.id) && !variant.associatedImageIds.includes(source.mediaId!))) throw new BatchError('The current Shopify variant-to-color source association changed.');
+      try { garment = await this.shopify.downloadImage(source.url); }
+      catch (error) {
+        item.sourceFreshness = { state: 'source_unavailable', checkedAt: new Date().toISOString(), reason: error instanceof Error ? error.message : 'The current Shopify source could not be downloaded.', currentMediaId: source.mediaId };
+        throw error;
+      }
+      acquiredSource = source;
+      const currentHash = this.hash(garment);
+      const previous = this.previousProvenance(batch.productId, item.color, batch.id);
+      currentComparison = previous ? previous.sha256 === currentHash ? 'matches_preserved' : 'source_changed' : 'not_comparable';
     }
     const inspected = await inspectImage(garment, ['png']);
-    if (inspected.format !== 'png' || !(await analyzeTransparency(garment)).isMeaningfullyTransparent) throw new BatchError('The mapped source is no longer a compatible transparent PNG.');
-    if (!item.sourceAsset) item.sourceAsset = await this.assets.save('garment', garment, 'png', { originalName: `${batch.productTitle}-${item.color}-source.png`, width: inspected.width, height: inspected.height, hasTransparency: true });
+    if (inspected.format !== 'png' || !(await analyzeTransparency(garment)).isMeaningfullyTransparent) {
+      if (acquiredSource) item.sourceFreshness = { state: 'source_unavailable', checkedAt: new Date().toISOString(), reason: 'The current Shopify source is not a meaningful transparent PNG.', currentMediaId: acquiredSource.mediaId };
+      throw new BatchError('The mapped source is no longer a compatible transparent PNG.');
+    }
+    if (acquiredSource) item.sourceFreshness = { state: 'verified_current', checkedAt: new Date().toISOString(), reason: currentComparison === 'source_changed' ? 'The current verified Shopify source differs from the previously preserved source; a new local asset was stored.' : 'The source was downloaded from the uniquely associated current Shopify media.', currentMediaId: acquiredSource.mediaId, currentSha256: this.hash(garment), comparison: currentComparison };
+    if (!item.sourceAsset) {
+      const acquiredAt = new Date().toISOString();
+      if (!acquiredSource?.mediaId) throw new BatchError('The verified Shopify source lacks MediaImage provenance.');
+      item.sourceAsset = await this.assets.saveGarment(garment, { originalName: `${batch.productTitle}-${item.color}-source.png`, width: inspected.width, height: inspected.height, hasTransparency: true }, { schemaVersion: 1, productId: batch.productId, color: item.color, mediaId: acquiredSource.mediaId, sourceReference: this.sourceReference(acquiredSource.url), acquiredAt, validatedAt: new Date().toISOString(), width: inspected.width, height: inspected.height, transparency: { meaningful: true } });
+      item.sourceProvenance = item.sourceAsset.provenance;
+    }
     const output = await this.compositor(background.buffer, garment);
     const meta = await sharp(output).metadata();
     item.preview = await this.assets.save('preview', output, 'png', { originalName: `${batch.productTitle}-${item.color}.png`, width: meta.width!, height: meta.height! });
+    item.generationEvidence = { generatedAt: new Date().toISOString(), sourceAssetId: item.sourceAsset.id, sourceSha256: this.hash(garment), backgroundAssetId: batch.backgroundId, backgroundSha256: this.hash(background.buffer), previewAssetId: item.preview.id, previewSha256: this.hash(output) };
   }
+
+  private previousProvenance(productId: string, color: string, excludeBatchId: string): GarmentSourceProvenance | undefined {
+    return this.list().filter((batch) => batch.id !== excludeBatchId && batch.productId === productId).flatMap((batch) => batch.items).find((item) => item.color === color && item.sourceProvenance)?.sourceProvenance;
+  }
+  private hash(buffer: Buffer) { return crypto.createHash('sha256').update(buffer).digest('hex'); }
+  private sourceReference(raw: string) { const url = new URL(raw); return `${url.origin}${url.pathname}`; }
 
   private async update(batch: MockupBatch) { batch.updatedAt = new Date().toISOString(); batch.counts = this.counts(batch.items); await this.persist(batch); }
   private counts(items: MockupBatchItem[]) { return { total: items.length, queued: items.filter((i) => i.status === 'queued').length, processing: items.filter((i) => i.status === 'processing').length, success: items.filter((i) => i.status === 'success').length, failed: items.filter((i) => i.status === 'failed').length, skipped: items.filter((i) => i.status === 'skipped').length, cancelled: items.filter((i) => i.status === 'cancelled').length }; }

@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -13,7 +14,7 @@ const product = (colors: string[], images: ShopifyProductDetail['images']): Shop
   variants: colors.map((color, index) => ({ id: `gid://shopify/ProductVariant/${index + 1}`, title: `${color} / M`, color, size: 'M', selectedOptions: [{ name: 'Color', value: color }], associatedImageIds: images.filter((image) => image.associatedColors.includes(color)).map((image) => image.id) }))
 });
 
-const image = (id: number, color: string) => ({ id: `gid://shopify/ProductImage/${id}`, url: `https://cdn.shopify.com/${id}.png`, associatedColors: [color], association: 'reliable' as const, validation: 'transparent' as const });
+const image = (id: number, color: string) => ({ id: `gid://shopify/ProductImage/${id}`, mediaId: `gid://shopify/MediaImage/${id}`, url: `https://cdn.shopify.com/${id}.png`, associatedColors: [color], association: 'reliable' as const, validation: 'transparent' as const });
 const waitFor = async (service: BatchService, id: string) => {
   for (let count = 0; count < 100; count += 1) {
     const batch = await service.get(id);
@@ -29,7 +30,7 @@ async function fixture(shopify: any, concurrency = 2, compositor?: any) {
   const background = await sharp({ create: { width: 40, height: 30, channels: 3, background: '#ffffff' } }).png().toBuffer();
   const saved = await assets.save('background', background, 'png', { originalName: 'background.png', width: 40, height: 30 });
   const service = new BatchService(root, assets, shopify, concurrency, compositor); await service.init();
-  return { service, background: saved };
+  return { root, assets, service, background: saved };
 }
 
 describe('BatchService', () => {
@@ -42,6 +43,9 @@ describe('BatchService', () => {
     expect(finished.status).toBe('completed');
     expect(finished.counts).toMatchObject({ success: 2, failed: 0, skipped: 0 });
     expect(finished.items.every((item) => item.preview?.url.startsWith('/api/assets/preview/'))).toBe(true);
+    expect(finished.items[0]).toMatchObject({ sourceProvenance: { schemaVersion: 1, productId: catalog.id, color: 'Black', mediaId: 'gid://shopify/MediaImage/1', assetId: finished.items[0].sourceAsset?.id, transparency: { meaningful: true } }, sourceFreshness: { state: 'verified_current' } });
+    expect(finished.items[0].sourceProvenance?.sha256).toBe(crypto.createHash('sha256').update(garment).digest('hex'));
+    expect(finished.items[0].generationEvidence).toMatchObject({ sourceSha256: finished.items[0].sourceProvenance?.sha256, backgroundAssetId: background.id, previewAssetId: finished.items[0].preview?.id });
     expect((await service.zip(finished.id)).subarray(0, 4).toString('hex')).toBe('504b0304');
   });
 
@@ -50,13 +54,29 @@ describe('BatchService', () => {
     const replacementGallery = product(['Black'], [{ ...image(99, 'Black'), validation: 'opaque' as const }]);
     const garment = await sharp({ create: { width: 20, height: 20, channels: 4, background: { r: 20, g: 30, b: 40, alpha: 0.5 } } }).png().toBuffer();
     const shopify = { getProduct: vi.fn().mockResolvedValue(original), downloadImage: vi.fn().mockResolvedValue(garment) };
-    const { service, background } = await fixture(shopify);
+    const { root, assets, service, background } = await fixture(shopify);
     const first = await waitFor(service, (await service.create(original.id, background.id)).id);
     expect(first.items[0].sourceAsset).toMatchObject({ kind: 'garment', hasTransparency: true });
     shopify.getProduct.mockResolvedValue(replacementGallery);
     const second = await waitFor(service, (await service.create(original.id, background.id)).id);
-    expect(second).toMatchObject({ status: 'completed', items: [{ status: 'success', sourceImageId: first.items[0].sourceImageId, sourceAsset: first.items[0].sourceAsset }] });
+    expect(second).toMatchObject({ status: 'completed', items: [{ status: 'success', sourceImageId: first.items[0].sourceImageId, sourceAsset: first.items[0].sourceAsset, sourceFreshness: { state: 'historical_unverified' } }] });
     expect(shopify.downloadImage).toHaveBeenCalledOnce();
+    const restarted = new BatchService(root, assets, shopify); await restarted.init();
+    expect((await restarted.get(second.id)).items[0].sourceFreshness?.state).toBe('historical_unverified');
+  });
+
+  it('stores a changed current source separately without overwriting historical source bytes', async () => {
+    const catalog = product(['Black'], [image(1, 'Black')]);
+    const firstBytes = await sharp({ create: { width: 20, height: 20, channels: 4, background: { r: 20, g: 30, b: 40, alpha: 0.5 } } }).png().toBuffer();
+    const secondBytes = await sharp({ create: { width: 20, height: 20, channels: 4, background: { r: 80, g: 30, b: 40, alpha: 0.5 } } }).png().toBuffer();
+    const shopify = { getProduct: vi.fn().mockResolvedValue(catalog), downloadImage: vi.fn().mockResolvedValueOnce(firstBytes).mockResolvedValue(secondBytes) };
+    const { service, assets, background } = await fixture(shopify);
+    const first = await waitFor(service, (await service.create(catalog.id, background.id)).id);
+    const second = await waitFor(service, (await service.create(catalog.id, background.id)).id);
+    expect(second.items[0]).toMatchObject({ sourceFreshness: { state: 'verified_current', comparison: 'source_changed' } });
+    expect(second.items[0].sourceAsset?.id).not.toBe(first.items[0].sourceAsset?.id);
+    expect((await assets.bytes('garment', first.items[0].sourceAsset!.id)).buffer.equals(firstBytes)).toBe(true);
+    expect((await assets.bytes('garment', second.items[0].sourceAsset!.id)).buffer.equals(secondBytes)).toBe(true);
   });
 
   it('skips incomplete catalogs and mapping conflicts for manual review', async () => {

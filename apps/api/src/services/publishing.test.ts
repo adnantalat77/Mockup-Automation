@@ -8,7 +8,7 @@ import { AssetStore } from './storage.js';
 import { BatchService } from './batches.js';
 import { PublicationError, PublishingService } from './publishing.js';
 
-const image = { id: 'gid://shopify/ProductImage/10', url: 'https://cdn.shopify.com/black.png', associatedColors: ['Black'], association: 'reliable' as const, validation: 'transparent' as const };
+const image = { id: 'gid://shopify/ProductImage/10', mediaId: 'gid://shopify/MediaImage/50', url: 'https://cdn.shopify.com/black.png', associatedColors: ['Black'], association: 'reliable' as const, validation: 'transparent' as const };
 const product: ShopifyProductDetail = {
   id: 'gid://shopify/Product/15608846975264', title: 'Mockup Automation - TEST ONLY', handle: 'test-shirt', status: 'DRAFT', colors: ['Black'], sizes: ['M', 'L'], images: [image],
   variants: [1, 2].map((id) => ({ id: `gid://shopify/ProductVariant/${id}`, title: `Black / ${id === 1 ? 'M' : 'L'}`, color: 'Black', size: id === 1 ? 'M' : 'L', selectedOptions: [{ name: 'Color', value: 'Black' }], associatedImageIds: [image.id] }))
@@ -19,7 +19,7 @@ const largeColors = ['Black', 'Navy', 'White', 'Red', 'Green', 'Blue', 'Gray', '
 const largeProduct: ShopifyProductDetail = {
   id: 'gid://shopify/Product/999', title: 'Allowlisted Production Shirt', handle: 'allowlisted-shirt', status: 'ACTIVE', colors: largeColors,
   sizes: Array.from({ length: 10 }, (_value, index) => `Size ${index + 1}`),
-  images: largeColors.map((color, index) => ({ id: `gid://shopify/MediaImage/${50 + index}`, url: `https://cdn.shopify.com/${color.toLowerCase()}.png`, associatedColors: [color], association: 'reliable', validation: 'transparent' })),
+  images: largeColors.map((color, index) => ({ id: `gid://shopify/MediaImage/${50 + index}`, mediaId: `gid://shopify/MediaImage/${50 + index}`, url: `https://cdn.shopify.com/${color.toLowerCase()}.png`, associatedColors: [color], association: 'reliable', validation: 'transparent' })),
   variants: largeColors.flatMap((color, colorIndex) => Array.from({ length: 10 }, (_value, sizeIndex) => ({
     id: `gid://shopify/ProductVariant/${1000 + colorIndex * 10 + sizeIndex}`, title: `${color} / Size ${sizeIndex + 1}`, color, size: `Size ${sizeIndex + 1}`,
     selectedOptions: [{ name: 'Color', value: color }, { name: 'Size', value: `Size ${sizeIndex + 1}` }], associatedImageIds: [`gid://shopify/MediaImage/${50 + colorIndex}`]
@@ -48,6 +48,7 @@ async function fixture(overrides: Record<string, unknown> = {}, selectedProduct:
   const api = {
     getProduct: vi.fn().mockResolvedValue(selectedProduct),
     getPublicationState: vi.fn().mockImplementation(async () => structuredClone(live)),
+    downloadImage: vi.fn().mockResolvedValue(garment),
     stageImage: vi.fn().mockResolvedValue('https://staged.example/image'),
     createImageFile: vi.fn().mockImplementation(async () => ({ id: `gid://shopify/MediaImage/${generatedStart + createdIndex++}`, fileStatus: 'PROCESSING' })),
     waitForFileReady: vi.fn().mockResolvedValue(undefined), addFileToProduct: vi.fn().mockImplementation(async (id: string) => { if (!live.mediaIds.includes(id)) live.mediaIds.push(id); }),
@@ -107,6 +108,98 @@ describe('PublishingService', () => {
     expect(operation.status).toBe('published');
     expect(api.replaceVariantMedia).toHaveBeenCalledWith(product.id, 'gid://shopify/MediaImage/99', product.variants.map((variant) => variant.id));
     expect(api.appendVariantMedia).not.toHaveBeenCalled();
+  });
+
+  it('revalidates a matching current source hash during final publication preflight', async () => {
+    const { batch, publishing, api } = await fixture();
+    await expect(publishing.validate(batch.id)).resolves.toMatchObject({ ready: true });
+    expect(api.downloadImage).toHaveBeenCalled();
+    expect(batch.items[0]).toMatchObject({ sourceProvenance: { schemaVersion: 1 }, sourceFreshness: { state: 'verified_current' } });
+  });
+
+  it.each([
+    ['detached current source', (current: ShopifyProductDetail) => { current.images = []; }, /exactly one reliable current source|historical/i],
+    ['ambiguous current sources', (current: ShopifyProductDetail) => { current.images.push({ ...current.images[0], id: 'gid://shopify/ProductImage/11', mediaId: 'gid://shopify/MediaImage/51' }); }, /exactly one reliable current source/i],
+    ['changed variant mapping', (current: ShopifyProductDetail) => { current.variants[0].associatedImageIds = []; }, /mapping conflicts/i]
+  ])('blocks publication for %s before mutation', async (_name, mutate, message) => {
+    const { batch, publishing, api } = await fixture();
+    const current = structuredClone(product); mutate(current); api.getProduct.mockResolvedValue(current);
+    const readiness = await publishing.validate(batch.id);
+    expect(readiness.ready).toBe(false); expect(readiness.errors.join(' ')).toMatch(message);
+    await expect(publishing.publish(batch.id)).rejects.toBeInstanceOf(PublicationError);
+    expect(api.stageImage).not.toHaveBeenCalled(); expect(api.createImageFile).not.toHaveBeenCalled();
+  });
+
+  it('blocks an unchanged cached garment when provenance is missing', async () => {
+    const { batch, publishing, api } = await fixture();
+    delete batch.items[0].sourceProvenance;
+    const readiness = await publishing.validate(batch.id);
+    expect(readiness.ready).toBe(false); expect(readiness.errors.join(' ')).toMatch(/provenance is missing/i);
+    expect(api.stageImage).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['source', 'uploads/garments', /source bytes/i],
+    ['background', 'uploads/backgrounds', /hash evidence/i],
+    ['preview', 'generated/previews', /hash evidence/i]
+  ])('blocks publication when the recorded %s asset bytes change', async (kind, folder, message) => {
+    const { root, batch, publishing, api } = await fixture();
+    const item = batch.items[0]; const assetId = kind === 'source' ? item.sourceAsset!.id : kind === 'background' ? batch.backgroundId : item.preview!.id;
+    const replacement = await sharp({ create: { width: 20, height: 20, channels: 4, background: { r: 200, g: 10, b: 10, alpha: kind === 'source' ? 0.5 : 1 } } }).png().toBuffer();
+    await writeFile(path.join(root, folder, `${assetId}.png`), replacement);
+    const readiness = await publishing.validate(batch.id);
+    expect(readiness.ready).toBe(false); expect(readiness.errors.join(' ')).toMatch(message);
+    expect(api.stageImage).not.toHaveBeenCalled();
+  });
+
+  it('blocks changed, opaque, or unavailable current Shopify source bytes', async () => {
+    const changed = await fixture();
+    changed.api.downloadImage.mockResolvedValue(await sharp({ create: { width: 20, height: 20, channels: 4, background: { r: 99, g: 30, b: 40, alpha: 0.5 } } }).png().toBuffer());
+    expect((await changed.publishing.validate(changed.batch.id)).errors.join(' ')).toMatch(/artwork changed/i);
+    expect(changed.api.stageImage).not.toHaveBeenCalled();
+
+    const opaque = await fixture();
+    opaque.api.downloadImage.mockResolvedValue(await sharp({ create: { width: 20, height: 20, channels: 4, background: { r: 20, g: 30, b: 40, alpha: 1 } } }).png().toBuffer());
+    expect((await opaque.publishing.validate(opaque.batch.id)).errors.join(' ')).toMatch(/unavailable or invalid/i);
+
+    const unavailable = await fixture(); unavailable.api.downloadImage.mockRejectedValue(new Error('download unavailable'));
+    expect((await unavailable.publishing.validate(unavailable.batch.id)).errors.join(' ')).toMatch(/download unavailable/i);
+  });
+
+  it('blocks partial-operation recovery when current artwork changes after publication starts', async () => {
+    const { batch, publishing, api } = await fixture();
+    api.waitForFileReady.mockRejectedValueOnce(new Error('processing interrupted'));
+    const operation = await publishing.publish(batch.id);
+    expect(operation.status).toBe('partial');
+    api.downloadImage.mockResolvedValue(await sharp({ create: { width: 20, height: 20, channels: 4, background: { r: 90, g: 30, b: 40, alpha: 0.5 } } }).png().toBuffer());
+    await expect(publishing.validateRecovery(operation.id, batch.id)).resolves.toMatchObject({ eligible: false, errors: expect.arrayContaining([expect.stringMatching(/source validation|artwork changed/i)]) });
+    await expect(publishing.resume(operation.id, batch.id)).rejects.toBeInstanceOf(PublicationError);
+    expect(api.addFileToProduct).not.toHaveBeenCalled();
+  });
+
+  it('blocks partial-operation recovery when batch regeneration replaces immutable evidence', async () => {
+    const { batch, batches, publishing, api } = await fixture();
+    api.stageImage.mockRejectedValueOnce(new Error('staging interrupted'));
+    const operation = await publishing.publish(batch.id);
+    expect(operation.status).toBe('partial');
+    await waitBatch(batches, (await batches.regenerate(batch.id, 'Black')).id);
+    const readiness = await publishing.validateRecovery(operation.id, batch.id);
+    expect(readiness.eligible).toBe(false); expect(readiness.errors.join(' ')).toMatch(/preview no longer matches|evidence changed/i);
+    await expect(publishing.resume(operation.id, batch.id)).rejects.toBeInstanceOf(PublicationError);
+    expect(api.createImageFile).not.toHaveBeenCalled();
+  });
+
+  it('stops before upload when preview bytes change after final preflight', async () => {
+    const { root, assets, batch, publishing, api } = await fixture();
+    const item = batch.items[0]; const sourceBytes = (await assets.bytes('garment', item.sourceAsset!.id)).buffer;
+    const changedPreview = await sharp({ create: { width: 30, height: 30, channels: 4, background: { r: 200, g: 10, b: 10, alpha: 1 } } }).png().toBuffer();
+    api.downloadImage.mockImplementationOnce(async () => {
+      await writeFile(path.join(root, 'generated', 'previews', `${item.preview!.id}.png`), changedPreview);
+      return sourceBytes;
+    });
+    const operation = await publishing.publish(batch.id);
+    expect(operation).toMatchObject({ status: 'conflict', errors: [expect.stringMatching(/preview bytes changed/i)] });
+    expect(api.stageImage).not.toHaveBeenCalled(); expect(api.createImageFile).not.toHaveBeenCalled();
   });
 
   it('supports sequential verified publications and rolls the second back only to the first gallery', async () => {

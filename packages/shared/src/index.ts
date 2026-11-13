@@ -86,6 +86,7 @@ export interface MockupBatch {
 }
 
 export type PublicationStatus = 'validated' | 'publishing' | 'published' | 'partial' | 'rolling_back' | 'rolled_back' | 'rolled_back_files_retained' | 'rollback_partial' | 'conflict' | 'abandoned';
+export type RollbackMode = 'no_global_delete';
 
 export interface RollbackFinalizationEvidence {
   verifiedAt: string;
@@ -100,7 +101,7 @@ export interface RollbackFinalizationEvidence {
   retainedGeneratedMediaIds: string[];
   retainedFileConflicts: string[];
   retainedFileOutcomes?: GeneratedFileCleanupOutcome[];
-  cleanupReason: 'global_file_deletion_ownership_unproven';
+  cleanupReason: 'global_file_deletion_ownership_unproven' | 'global_deletion_prohibited_by_operator';
   previousStatus?: 'conflict';
   newStatus?: 'rolled_back_files_retained';
   confirmation?: string;
@@ -109,10 +110,11 @@ export interface RollbackFinalizationEvidence {
 export type GeneratedFileCleanupOutcome =
   | { kind: 'deleted_safely'; mediaId: string; recordedAt: string; ownershipProof: 'exclusive_operation_ownership' }
   | { kind: 'retained_ownership_unproven'; mediaId: string; recordedAt: string; reasonCode: 'global_references_unverifiable'; reason: string }
+  | { kind: 'retained_by_operator'; mediaId: string; recordedAt: string; reasonCode: 'global_deletion_prohibited_by_operator'; reason: string }
   | { kind: 'cleanup_failed'; mediaId: string; recordedAt: string; phase: 'ownership_verification' | 'reference_removal'; reason: string }
   | { kind: 'cleanup_outcome_uncertain'; mediaId: string; recordedAt: string; phase: 'file_delete'; reason: string };
 
-export type PublicationConflictKind = 'retained_file_ownership_unproven' | 'cleanup_failed' | 'cleanup_outcome_uncertain' | 'uncertain_file_creation' | 'restoration_mismatch' | 'external_state_conflict';
+export type PublicationConflictKind = 'retained_file_ownership_unproven' | 'retained_file_deletion_prohibited' | 'cleanup_failed' | 'cleanup_outcome_uncertain' | 'uncertain_file_creation' | 'restoration_mismatch' | 'external_state_conflict';
 
 export interface RollbackFinalizationReadiness {
   eligible: boolean;
@@ -168,6 +170,7 @@ export interface PublicationOperation {
   updatedAt: string;
   status: PublicationStatus;
   publicationMode?: 'append_originals' | 'replace_gallery';
+  rollbackMode?: RollbackMode;
   predecessorOperationId?: string;
   originalMediaOrder: string[];
   originalVariantMedia: Array<{ variantId: string; mediaIds: string[] }>;

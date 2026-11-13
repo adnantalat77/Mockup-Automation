@@ -80,7 +80,7 @@ async function retainedRollbackFixture(selectedProduct: ShopifyProductDetail = p
   const confirmation = selectedProduct.id === product.id ? 'PUBLISH' : `PUBLISH ${selectedProduct.id}`;
   const published = await result.publishing.publish(result.batch.id, confirmation);
   result.api.verifyFileDeletionSafe.mockResolvedValueOnce({ safe: false, reason: 'global references cannot be proven exclusive', reasonCode: 'global_references_unverifiable' });
-  const operation = await result.publishing.rollback(published.id);
+  const operation = await result.publishing.rollback(published.id, 'no_global_delete');
   expect(operation).toMatchObject({ status: 'conflict', productRestored: true, items: [{ status: 'rolled_back', cleanupPending: true }] });
   vi.clearAllMocks();
   result.api.getProduct.mockResolvedValue(selectedProduct);
@@ -89,6 +89,17 @@ async function retainedRollbackFixture(selectedProduct: ShopifyProductDetail = p
 }
 
 describe('PublishingService', () => {
+  it('requires the explicit no_global_delete rollback mode before reading Shopify', async () => {
+    const { batch, publishing, api } = await fixture();
+    const published = await publishing.publish(batch.id);
+    vi.clearAllMocks();
+    await expect((publishing.rollback as any)(published.id)).rejects.toMatchObject({ status: 400 });
+    await expect((publishing.rollback as any)(published.id, 'delete_files')).rejects.toMatchObject({ status: 400 });
+    expect(api.getPublicationState).not.toHaveBeenCalled();
+    expect(api.verifyFileDeletionSafe).not.toHaveBeenCalled();
+    expect(api.deleteFile).not.toHaveBeenCalled();
+  });
+
   it('validates and publishes all size variants for a color', async () => {
     const { batch, api, publishing } = await fixture();
     await expect(publishing.validate(batch.id)).resolves.toMatchObject({ ready: true, imageCount: 1, variantCount: 2 });
@@ -109,8 +120,8 @@ describe('PublishingService', () => {
     expect(second.originalMediaOrder).toEqual(['gid://shopify/MediaImage/99']);
     expect(second.originalVariantMedia.every((entry) => entry.mediaIds[0] === 'gid://shopify/MediaImage/99')).toBe(true);
     expect(live.mediaIds).toEqual(['gid://shopify/MediaImage/100']);
-    await expect(publishing.rollback(first.id)).rejects.toMatchObject({ status: 409 });
-    await expect(publishing.rollback(second.id)).resolves.toMatchObject({ status: 'rolled_back' });
+    await expect(publishing.rollback(first.id, 'no_global_delete')).rejects.toMatchObject({ status: 409 });
+    await expect(publishing.rollback(second.id, 'no_global_delete')).resolves.toMatchObject({ status: 'conflict', productRestored: true });
     expect(live.mediaIds).toEqual(['gid://shopify/MediaImage/99']);
     expect(live.variants.every((variant) => variant.mediaIds[0] === 'gid://shopify/MediaImage/99')).toBe(true);
     expect((await readdir(path.join(root, 'publications', first.id))).filter((name) => name.endsWith('.json'))).toHaveLength(firstCheckpointCount);
@@ -158,7 +169,7 @@ describe('PublishingService', () => {
     const second = await publishing.publish(secondBatch.id);
     const recovered = new PublishingService(root, assets, batches, api as any); await recovered.init();
     expect(recovered.get(second.id).predecessorOperationId).toBe(first.id);
-    await expect(recovered.rollback(first.id)).rejects.toMatchObject({ status: 409 });
+    await expect(recovered.rollback(first.id, 'no_global_delete')).rejects.toMatchObject({ status: 409 });
     await expect(recovered.validate(secondBatch.id)).resolves.toMatchObject({ ready: false });
   });
 
@@ -180,8 +191,8 @@ describe('PublishingService', () => {
     expect(api.removeFileFromProduct).toHaveBeenCalledTimes(8);
     expect(api.deleteFile).not.toHaveBeenCalled();
 
-    const rolledBack = await publishing.rollback(published.id);
-    expect(rolledBack.status).toBe('rolled_back');
+    const rolledBack = await publishing.rollback(published.id, 'no_global_delete');
+    expect(rolledBack).toMatchObject({ status: 'conflict', productRestored: true, rollbackMode: 'no_global_delete' });
     expect(live.mediaIds).toEqual(largeColors.map((_color, index) => `gid://shopify/MediaImage/${50 + index}`));
     for (let colorIndex = 0; colorIndex < largeColors.length; colorIndex += 1) {
       const originalMedia = `gid://shopify/MediaImage/${50 + colorIndex}`;
@@ -244,35 +255,35 @@ describe('PublishingService', () => {
     expect(recovered.get(operation.id).status).toBe('partial');
   });
 
-  it('rolls back created media and restores original ordering', async () => {
+  it('restores original ordering and deliberately retains generated files', async () => {
     const { batch, api, publishing } = await fixture();
     const published = await publishing.publish(batch.id);
-    const rolledBack = await publishing.rollback(published.id);
-    expect(rolledBack.status).toBe('rolled_back');
-    expect(api.detachVariantMedia).not.toHaveBeenCalled(); expect(api.deleteFile).toHaveBeenCalledWith('gid://shopify/MediaImage/99');
+    const rolledBack = await publishing.rollback(published.id, 'no_global_delete');
+    expect(rolledBack).toMatchObject({ status: 'conflict', productRestored: true, rollbackMode: 'no_global_delete', items: [{
+      cleanupPending: true, cleanupOutcome: { kind: 'retained_by_operator', reasonCode: 'global_deletion_prohibited_by_operator', mediaId: 'gid://shopify/MediaImage/99' }
+    }] });
+    expect(api.detachVariantMedia).not.toHaveBeenCalled(); expect(api.verifyFileDeletionSafe).not.toHaveBeenCalled(); expect(api.deleteFile).not.toHaveBeenCalled();
     expect(api.replaceVariantMedia).toHaveBeenLastCalledWith(product.id, 'gid://shopify/MediaImage/50', product.variants.map((variant) => variant.id));
     expect(api.reorderMedia).toHaveBeenCalledWith(product.id, ['gid://shopify/MediaImage/50']);
   });
 
-  it('records an ambiguous file deletion and refuses an unsafe automatic retry', async () => {
+  it('never reaches deletion methods during rollback or after restart', async () => {
     const { root, assets, batches, batch, api, publishing } = await fixture();
     const published = await publishing.publish(batch.id);
-    api.deleteFile.mockRejectedValueOnce(new Error('Delete failed.'));
-    const conflicted = await publishing.rollback(published.id);
-    expect(conflicted).toMatchObject({ status: 'conflict', conflictKinds: expect.arrayContaining(['cleanup_outcome_uncertain']) });
-    await expect(publishing.rollback(published.id)).rejects.toBeInstanceOf(PublicationError);
-    const errorCount = conflicted.errors.length;
+    const conflicted = await publishing.rollback(published.id, 'no_global_delete');
+    expect(conflicted).toMatchObject({ status: 'conflict', conflictKinds: ['retained_file_deletion_prohibited'], productRestored: true });
+    expect(api.verifyFileDeletionSafe).not.toHaveBeenCalled(); expect(api.deleteFile).not.toHaveBeenCalled();
     const recovered = new PublishingService(root, assets, batches, api as any); await recovered.init();
-    expect(recovered.get(published.id)).toMatchObject({ status: 'conflict', errors: expect.any(Array) });
-    expect(recovered.get(published.id).errors).toHaveLength(errorCount);
-    await expect(recovered.rollback(published.id)).rejects.toBeInstanceOf(PublicationError);
+    expect(recovered.get(published.id)).toMatchObject({ status: 'conflict', rollbackMode: 'no_global_delete', productRestored: true });
+    await expect(recovered.rollback(published.id, 'no_global_delete')).resolves.toMatchObject({ status: 'conflict', productRestored: true });
+    expect(api.verifyFileDeletionSafe).not.toHaveBeenCalled(); expect(api.deleteFile).not.toHaveBeenCalled();
   });
 
   it('blocks rollback when external Shopify media changes are detected', async () => {
     const { batch, api, publishing } = await fixture();
     const published = await publishing.publish(batch.id);
     api.getPublicationState.mockResolvedValueOnce({ complete: true, mediaIds: ['gid://shopify/MediaImage/50', 'gid://shopify/MediaImage/99', 'gid://shopify/MediaImage/777'], variants: [] });
-    const result = await publishing.rollback(published.id);
+    const result = await publishing.rollback(published.id, 'no_global_delete');
     expect(result.status).toBe('conflict'); expect(api.deleteFile).not.toHaveBeenCalled();
   });
 
@@ -308,7 +319,7 @@ describe('PublishingService', () => {
     await writeFile(path.join(directory, `${String(count).padStart(6, '0')}.json`), JSON.stringify(interrupted));
     const recovered = new PublishingService(root, assets, batches, api as any); await recovered.init();
     expect(recovered.get(operation.id)).toMatchObject({ status: 'conflict', items: [{ cleanupOutcome: { kind: 'cleanup_outcome_uncertain', phase: 'file_delete' } }] });
-    await expect(recovered.rollback(operation.id)).rejects.toBeInstanceOf(PublicationError);
+    await expect(recovered.rollback(operation.id, 'no_global_delete')).rejects.toBeInstanceOf(PublicationError);
     expect(api.deleteFile).not.toHaveBeenCalled();
   });
 
@@ -367,9 +378,27 @@ describe('PublishingService', () => {
       for (const variant of live.variants) if (variantIds.includes(variant.id)) variant.mediaIds = [mediaId];
       throw new Error('connection lost after original association was restored');
     });
-    await expect(publishing.rollback(published.id)).resolves.toMatchObject({ status: 'rollback_partial' });
-    await expect(publishing.rollback(published.id)).resolves.toMatchObject({ status: 'rolled_back' });
+    await expect(publishing.rollback(published.id, 'no_global_delete')).resolves.toMatchObject({ status: 'rollback_partial' });
+    await expect(publishing.rollback(published.id, 'no_global_delete')).resolves.toMatchObject({ status: 'conflict', productRestored: true });
     expect(api.replaceVariantMedia).toHaveBeenCalledTimes(2);
+    expect(api.verifyFileDeletionSafe).not.toHaveBeenCalled(); expect(api.deleteFile).not.toHaveBeenCalled();
+  });
+
+  it('reconciles an interrupted generated-reference removal without deletion or duplicate removal', async () => {
+    const { batch, publishing, api, live } = await fixture();
+    const published = await publishing.publish(batch.id);
+    vi.clearAllMocks();
+    api.getPublicationState.mockImplementation(async () => structuredClone(live));
+    api.removeFileFromProduct.mockImplementationOnce(async (mediaId: string) => {
+      live.mediaIds = live.mediaIds.filter((id) => id !== mediaId);
+      throw new Error('connection lost after generated reference removal');
+    });
+    await expect(publishing.rollback(published.id, 'no_global_delete')).resolves.toMatchObject({ status: 'rollback_partial' });
+    await expect(publishing.rollback(published.id, 'no_global_delete')).resolves.toMatchObject({
+      status: 'conflict', productRestored: true, items: [{ cleanupOutcome: { kind: 'retained_by_operator' } }]
+    });
+    expect(api.removeFileFromProduct).toHaveBeenCalledOnce();
+    expect(api.verifyFileDeletionSafe).not.toHaveBeenCalled(); expect(api.deleteFile).not.toHaveBeenCalled();
   });
 
   it('safely retries failures before staging and product-reference mutation boundaries', async () => {
@@ -459,34 +488,26 @@ describe('PublishingService', () => {
     const { batch, publishing, api, live } = await fixture();
     const published = await publishing.publish(batch.id);
     live.variants[0].mediaIds.push('gid://shopify/MediaImage/777');
-    await expect(publishing.rollback(published.id)).resolves.toMatchObject({ status: 'conflict' });
+    await expect(publishing.rollback(published.id, 'no_global_delete')).resolves.toMatchObject({ status: 'conflict' });
     expect(api.detachVariantMedia).not.toHaveBeenCalled();
   });
 
-  it('preserves a created file when global references cannot be proven exclusive', async () => {
+  it('preserves a created file because global deletion is explicitly prohibited', async () => {
     const { batch, publishing, api } = await fixture();
     const published = await publishing.publish(batch.id);
-    api.verifyFileDeletionSafe.mockResolvedValueOnce({ safe: false, reason: 'shared reference may exist', reasonCode: 'global_references_unverifiable' });
-    await expect(publishing.rollback(published.id)).resolves.toMatchObject({
-      status: 'conflict', productRestored: true, cleanupConflicts: [expect.stringContaining('generated file was preserved')]
+    await expect(publishing.rollback(published.id, 'no_global_delete')).resolves.toMatchObject({
+      status: 'conflict', productRestored: true, cleanupConflicts: [expect.stringContaining('deliberately retained')]
     });
-    expect(api.deleteFile).not.toHaveBeenCalled();
+    expect(api.verifyFileDeletionSafe).not.toHaveBeenCalled(); expect(api.deleteFile).not.toHaveBeenCalled();
   });
 
-  it('records machine-readable outcomes for safe deletion, retained files, cleanup failure, and uncertain deletion', async () => {
-    const deleted = await fixture(); const deletedPublication = await deleted.publishing.publish(deleted.batch.id);
-    await expect(deleted.publishing.rollback(deletedPublication.id)).resolves.toMatchObject({ items: [{ cleanupOutcome: { kind: 'deleted_safely', ownershipProof: 'exclusive_operation_ownership' } }] });
-
-    const retained = await retainedRollbackFixture();
-    expect(retained.operation.items[0].cleanupOutcome).toMatchObject({ kind: 'retained_ownership_unproven', reasonCode: 'global_references_unverifiable', mediaId: 'gid://shopify/MediaImage/99' });
-
-    const failed = await fixture(); const failedPublication = await failed.publishing.publish(failed.batch.id);
-    failed.api.verifyFileDeletionSafe.mockRejectedValueOnce(new Error('ownership registry unavailable'));
-    await expect(failed.publishing.rollback(failedPublication.id)).resolves.toMatchObject({ status: 'rollback_partial', items: [{ cleanupOutcome: { kind: 'cleanup_failed', phase: 'ownership_verification' } }] });
-
-    const uncertain = await fixture(); const uncertainPublication = await uncertain.publishing.publish(uncertain.batch.id);
-    uncertain.api.deleteFile.mockRejectedValueOnce(new Error('connection lost after delete request'));
-    await expect(uncertain.publishing.rollback(uncertainPublication.id)).resolves.toMatchObject({ status: 'conflict', conflictKinds: expect.arrayContaining(['cleanup_outcome_uncertain']), items: [{ cleanupOutcome: { kind: 'cleanup_outcome_uncertain', phase: 'file_delete' } }] });
+  it('records a machine-readable deliberate-retention outcome even when deletion would otherwise be reported safe', async () => {
+    const retained = await fixture();
+    const published = await retained.publishing.publish(retained.batch.id);
+    retained.api.verifyFileDeletionSafe.mockResolvedValue({ safe: true, reason: 'operation-owned' });
+    const operation = await retained.publishing.rollback(published.id, 'no_global_delete');
+    expect(operation.items[0].cleanupOutcome).toMatchObject({ kind: 'retained_by_operator', reasonCode: 'global_deletion_prohibited_by_operator', mediaId: 'gid://shopify/MediaImage/99' });
+    expect(retained.api.verifyFileDeletionSafe).not.toHaveBeenCalled(); expect(retained.api.deleteFile).not.toHaveBeenCalled();
   });
 
   it('verifies and finalizes a restored product while retaining generated files without Shopify mutations', async () => {
@@ -501,12 +522,24 @@ describe('PublishingService', () => {
     const finalized = await publishing.finalizeRollback(operation.id, confirmation);
     expect(finalized).toMatchObject({ status: 'rolled_back_files_retained', rollbackFinalizationEvidence: {
       previousStatus: 'conflict', newStatus: 'rolled_back_files_retained', confirmation,
-      cleanupReason: 'global_file_deletion_ownership_unproven', retainedGeneratedMediaIds: ['gid://shopify/MediaImage/99']
+      cleanupReason: 'global_deletion_prohibited_by_operator', retainedGeneratedMediaIds: ['gid://shopify/MediaImage/99']
     }, items: [{ cleanupPending: false, cleanupDisposition: 'retained_manual_ownership_review' }] });
     expect((await readdir(path.join(root, 'publications', operation.id))).filter((name) => name.endsWith('.json'))).toHaveLength(before + 1);
     expect(api.stageImage).not.toHaveBeenCalled(); expect(api.createImageFile).not.toHaveBeenCalled(); expect(api.addFileToProduct).not.toHaveBeenCalled();
     expect(api.replaceVariantMedia).not.toHaveBeenCalled(); expect(api.removeFileFromProduct).not.toHaveBeenCalled(); expect(api.deleteFile).not.toHaveBeenCalled(); expect(api.reorderMedia).not.toHaveBeenCalled();
     await expect(publishing.finalizeRollback(operation.id, confirmation)).rejects.toBeInstanceOf(PublicationError);
+  });
+
+  it('preserves finalization support for historical ownership-unproven retention evidence', async () => {
+    const { operation, publishing } = await retainedRollbackFixture();
+    const stored = publishing.get(operation.id);
+    stored.items[0].cleanupOutcome = {
+      kind: 'retained_ownership_unproven', mediaId: stored.items[0].createdMediaId!, recordedAt: new Date().toISOString(),
+      reasonCode: 'global_references_unverifiable', reason: 'Historical adapter could not enumerate global references.'
+    };
+    stored.conflictKinds = ['retained_file_ownership_unproven'];
+    const readiness = await publishing.validateRollbackFinalization(operation.id);
+    expect(readiness).toMatchObject({ eligible: true, evidence: { cleanupReason: 'global_file_deletion_ownership_unproven' } });
   });
 
   it('finalizes a completely restored allowlisted real product without deleting retained global files', async () => {
@@ -536,17 +569,18 @@ describe('PublishingService', () => {
   it('fails closed for legacy unfinalized cleanup conflicts but keeps historical finalized checkpoints terminal and readable', async () => {
     const legacy = await retainedRollbackFixture(); delete legacy.publishing.get(legacy.operation.id).items[0].cleanupOutcome;
     const readiness = await legacy.publishing.validateRollbackFinalization(legacy.operation.id);
-    expect(readiness).toMatchObject({ eligible: false, errors: [expect.stringMatching(/machine-readable|Legacy/)] });
+    expect(readiness.eligible).toBe(false); expect(readiness.errors.join(' ')).toMatch(/machine-readable|Legacy/);
     expect(legacy.api.getPublicationState).not.toHaveBeenCalled();
 
     const finalized = await retainedRollbackFixture(); const confirmation = `FINALIZE ${finalized.operation.id} FILES RETAINED`;
     const terminal = await finalized.publishing.finalizeRollback(finalized.operation.id, confirmation);
     const directory = path.join(finalized.root, 'publications', terminal.id); const count = (await readdir(directory)).filter((name) => name.endsWith('.json')).length;
     const historical = structuredClone(terminal); delete historical.items[0].cleanupOutcome;
+    historical.rollbackFinalizationEvidence!.cleanupReason = 'global_file_deletion_ownership_unproven';
     await writeFile(path.join(directory, `${String(count).padStart(6, '0')}.json`), JSON.stringify(historical));
     const recovered = new PublishingService(finalized.root, finalized.assets, finalized.batches, finalized.api as any); await recovered.init();
     expect(recovered.get(terminal.id)).toMatchObject({ status: 'rolled_back_files_retained', rollbackFinalizationEvidence: { cleanupReason: 'global_file_deletion_ownership_unproven' } });
-    await expect(recovered.rollback(terminal.id)).rejects.toBeInstanceOf(PublicationError);
+    await expect(recovered.rollback(terminal.id, 'no_global_delete')).rejects.toBeInstanceOf(PublicationError);
   });
 
   it.each([

@@ -193,7 +193,8 @@ export async function createApp(overrides: Partial<AppConfig> = {}) {
       authorizePublishing(request);
       await verifyPublishingScopes();
       if (request.body?.confirm !== 'ROLLBACK') throw new PublicationError('Explicit rollback confirmation is required.', 400);
-      response.json(await publishing!.rollback(request.params.id));
+      if (request.body?.mode !== 'no_global_delete') throw new PublicationError('Explicit no_global_delete rollback mode is required.', 400);
+      response.json(await publishing!.rollback(request.params.id, request.body.mode));
     } catch (error) { next(error); }
   });
 

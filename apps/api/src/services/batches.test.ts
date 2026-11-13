@@ -45,6 +45,20 @@ describe('BatchService', () => {
     expect((await service.zip(finished.id)).subarray(0, 4).toString('hex')).toBe('504b0304');
   });
 
+  it('reuses preserved transparent garment sources after originals leave the Shopify gallery', async () => {
+    const original = product(['Black'], [image(1, 'Black')]);
+    const replacementGallery = product(['Black'], [{ ...image(99, 'Black'), validation: 'opaque' as const }]);
+    const garment = await sharp({ create: { width: 20, height: 20, channels: 4, background: { r: 20, g: 30, b: 40, alpha: 0.5 } } }).png().toBuffer();
+    const shopify = { getProduct: vi.fn().mockResolvedValue(original), downloadImage: vi.fn().mockResolvedValue(garment) };
+    const { service, background } = await fixture(shopify);
+    const first = await waitFor(service, (await service.create(original.id, background.id)).id);
+    expect(first.items[0].sourceAsset).toMatchObject({ kind: 'garment', hasTransparency: true });
+    shopify.getProduct.mockResolvedValue(replacementGallery);
+    const second = await waitFor(service, (await service.create(original.id, background.id)).id);
+    expect(second).toMatchObject({ status: 'completed', items: [{ status: 'success', sourceImageId: first.items[0].sourceImageId, sourceAsset: first.items[0].sourceAsset }] });
+    expect(shopify.downloadImage).toHaveBeenCalledOnce();
+  });
+
   it('skips incomplete catalogs and mapping conflicts for manual review', async () => {
     const catalog = product(['Black', 'Navy'], [image(1, 'Black'), image(2, 'Black')]);
     const { service } = await fixture({ getProduct: vi.fn(), downloadImage: vi.fn() });

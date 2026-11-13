@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import { mkdir, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { AbandonReadiness, AbandonmentEvidence, MockupBatch, PublicationItem, PublicationOperation, PublishReadiness, RecoveryReadiness, RollbackFinalizationEvidence, RollbackFinalizationReadiness } from '@mockup-automation/shared';
-import { inspectImage } from './images.js';
+import { analyzeTransparency, inspectImage } from './images.js';
 import { AssetStore } from './storage.js';
 import { BatchService } from './batches.js';
 import type { ShopifyPublicationState, ShopifyService } from './shopify.js';
@@ -12,7 +12,7 @@ const PRODUCT_GID = /^gid:\/\/shopify\/Product\/[1-9]\d*$/;
 const STEP = (kind: string, color: string) => `${kind}:${color}`;
 export const ABANDONMENT_TEST_PRODUCT_ID = 'gid://shopify/Product/15608846975264';
 const ABANDONMENT_TEST_PRODUCT_TITLE = 'Mockup Automation - TEST ONLY';
-const TERMINAL_STATUSES = new Set(['rolled_back', 'rolled_back_files_retained', 'abandoned']);
+const NONBLOCKING_STATUSES = new Set(['published', 'rolled_back', 'rolled_back_files_retained', 'abandoned']);
 type PublishingShopify = Pick<ShopifyService, 'getProduct' | 'getPublicationState' | 'stageImage' | 'createImageFile' | 'waitForFileReady' | 'addFileToProduct' | 'removeFileFromProduct' | 'replaceVariantMedia' | 'detachVariantMedia' | 'reorderMedia' | 'deleteFile' | 'verifyFileDeletionSafe'>;
 
 export class PublicationError extends Error { constructor(message: string, readonly status = 400) { super(message); } }
@@ -45,7 +45,7 @@ export class PublishingService {
       const operation = await this.readLatest(operationId).catch(() => undefined);
       if (!operation) continue;
       const uncertainItems = operation.items.filter((item) => item.intent === 'create_file' && !item.createdMediaId);
-      const uncertainDeletionItems = operation.items.filter((item) => item.intent === 'delete_file' && item.createdMediaId && !operation.completedSteps.includes(STEP('deleted', item.color)));
+      const uncertainDeletionItems = operation.items.filter((item) => item.intent === 'delete_file' && item.createdMediaId && item.cleanupOutcome?.kind !== 'cleanup_outcome_uncertain' && !operation.completedSteps.includes(STEP('deleted', item.color)));
       if (uncertainItems.length) {
         for (const item of uncertainItems) { item.uncertainCreation = true; item.status = 'failed'; item.error = 'Shopify file creation may have completed before the process stopped; ownership is uncertain.'; }
         operation.conflictKinds = ['uncertain_file_creation'];
@@ -64,6 +64,8 @@ export class PublishingService {
   get(id: string) { this.assertId(id); const operation = this.records.get(id); if (!operation) throw new PublicationError('Publication operation not found.', 404); return operation; }
   async validate(batchId: string): Promise<PublishReadiness> {
     const { batch, state, errors, colors } = await this.preflight(batchId);
+    const existing = this.list().find((operation) => operation.batchId === batchId);
+    if (existing) errors.push(`Batch ${batchId} already has publication operation ${existing.id}; generate a new batch for another publication.`);
     const blocker = this.blockingOperation(batch.productId);
     if (blocker) errors.push(`Publication operation ${blocker.id} must be rolled back or abandoned before a fresh publication.`);
     return { ready: !errors.length, batchId, productId: batch.productId, imageCount: colors.length, variantCount: colors.reduce((sum, item) => sum + item.variantIds.length, 0),
@@ -72,20 +74,26 @@ export class PublishingService {
   }
 
   async publish(batchId: string, confirmation = 'PUBLISH') {
-    const existing = this.list().find((op) => op.batchId === batchId && !TERMINAL_STATUSES.has(op.status));
-    if (existing) throw new PublicationError(`Batch ${batchId} already has publication operation ${existing.id}. Use operation recovery instead of starting a new publication.`, 409);
-    const context = await this.preflight(batchId);
-    if (context.errors.length) throw new PublicationError(context.errors.join(' '), 409);
-    if (confirmation !== this.publicationConfirmation(context.batch.productId)) throw new PublicationError(`Explicit publication confirmation for product ${context.batch.productId} is required.`, 400);
-    const blocker = this.blockingOperation(context.batch.productId);
-    if (blocker) throw new PublicationError(`Publication operation ${blocker.id} must be rolled back or abandoned before a fresh publication.`, 409);
-    const now = new Date().toISOString();
-    const operation: PublicationOperation = { id: crypto.randomUUID(), version: 1, batchId, productId: context.batch.productId, productTitle: context.batch.productTitle,
-      createdAt: now, updatedAt: now, status: 'validated', publicationMode: 'replace_gallery', originalMediaOrder: [...context.state.mediaIds],
-      originalVariantMedia: context.state.variants.map((v) => ({ variantId: v.id, mediaIds: [...v.mediaIds] })), expectedPublishedMediaOrder: [],
-      items: context.colors.map((item) => ({ color: item.color, previewId: item.previewId, variantIds: item.variantIds, status: 'pending' })), completedSteps: [], errors: [] };
-    this.records.set(operation.id, operation); await this.checkpoint(operation);
-    return this.continuePublication(operation, false);
+    const batch = await this.batches.get(batchId).catch(() => { throw new PublicationError('Batch not found.', 404); });
+    return this.withLock(batch.productId, async () => {
+      const existing = this.list().find((operation) => operation.batchId === batchId);
+      if (existing) throw new PublicationError(`Batch ${batchId} already has publication operation ${existing.id}. Generate a new batch for another publication.`, 409);
+      const context = await this.preflight(batchId);
+      if (context.batch.productId !== batch.productId) throw new PublicationError('The batch product changed during publication startup.', 409);
+      if (context.errors.length) throw new PublicationError(context.errors.join(' '), 409);
+      if (confirmation !== this.publicationConfirmation(context.batch.productId)) throw new PublicationError(`Explicit publication confirmation for product ${context.batch.productId} is required.`, 400);
+      const blocker = this.blockingOperation(context.batch.productId);
+      if (blocker) throw new PublicationError(`Publication operation ${blocker.id} must be rolled back, finalized, or abandoned before a fresh publication.`, 409);
+      const predecessor = this.latestOperation(context.batch.productId);
+      const now = new Date().toISOString();
+      const operation: PublicationOperation = { id: crypto.randomUUID(), version: 1, batchId, productId: context.batch.productId, productTitle: context.batch.productTitle,
+        createdAt: now, updatedAt: now, status: 'validated', publicationMode: 'replace_gallery', predecessorOperationId: predecessor?.id,
+        originalMediaOrder: [...context.state.mediaIds], originalVariantMedia: context.state.variants.map((v) => ({ variantId: v.id, mediaIds: [...v.mediaIds] })), expectedPublishedMediaOrder: [],
+        items: context.colors.map((item) => ({ color: item.color, previewId: item.previewId, variantIds: item.variantIds, status: 'pending' })), completedSteps: [], errors: [] };
+      this.records.set(operation.id, operation);
+      try { await this.checkpoint(operation); } catch (error) { operation.status = 'conflict'; operation.errors.push('Initial publication checkpoint persistence failed; this process will not start another operation for the product.'); this.records.set(operation.id, structuredClone(operation)); throw error; }
+      return this.continuePublication(operation, false, true);
+    });
   }
 
   async validateRecovery(operationId: string, batchId: string): Promise<RecoveryReadiness> {
@@ -127,8 +135,8 @@ export class PublishingService {
     return this.continuePublication(this.get(operationId), true);
   }
 
-  private async continuePublication(operation: PublicationOperation, recovering: boolean) {
-    return this.withLock(operation.productId, async () => {
+  private async continuePublication(operation: PublicationOperation, recovering: boolean, lockHeld = false) {
+    const action = async () => {
       if (recovering) {
         operation = this.get(operation.id);
         if (operation.status !== 'partial') throw new PublicationError(`Operation ${operation.id} is no longer eligible for recovery.`, 409);
@@ -198,7 +206,8 @@ export class PublishingService {
         operation!.status = 'published';
       } else operation!.status = 'partial';
       await this.checkpoint(operation!); return operation!;
-    });
+    };
+    return lockHeld ? action() : this.withLock(operation.productId, action);
   }
 
   async rollback(operationId: string) {
@@ -207,6 +216,7 @@ export class PublishingService {
     if (operation.items.some((item) => item.uncertainCreation || (item.intent === 'create_file' && !item.createdMediaId))) throw new PublicationError('Rollback cannot establish ownership of an uncertain file creation; manual reconciliation is required.', 409);
     if (operation.items.some((item) => item.cleanupOutcome?.kind === 'cleanup_outcome_uncertain' || item.intent === 'delete_file')) throw new PublicationError('Rollback cannot retry an uncertain file deletion; manual reconciliation is required.', 409);
     return this.withLock(operation.productId, async () => {
+      if (this.isSuperseded(operation)) throw new PublicationError('This operation was superseded by a newer publication checkpoint and can no longer be rolled back.', 409);
       const current = await this.shopify.getPublicationState(operation.productId);
       const conflict = this.compareExpected(operation, current, 'rollback'); if (conflict) return this.markConflict(operation, `Rollback blocked: ${conflict}`);
       operation.status = 'rolling_back'; operation.errors = []; operation.cleanupConflicts = []; operation.conflictKinds = []; operation.productRestored = false; await this.checkpoint(operation);
@@ -272,6 +282,7 @@ export class PublishingService {
           const conflictKind = item.cleanupOutcome?.kind === 'cleanup_outcome_uncertain' ? 'cleanup_outcome_uncertain' : 'cleanup_failed';
           if (!operation.conflictKinds.includes(conflictKind)) operation.conflictKinds.push(conflictKind);
           operation.errors.push(`${item.color}: ${item.error}`); await this.checkpoint(operation);
+          if (conflictKind === 'cleanup_outcome_uncertain') { operation.status = 'conflict'; await this.checkpoint(operation); return operation; }
         }
       }
       if (operation.items.every((item) => !item.createdMediaId || item.status === 'rolled_back')) {
@@ -318,6 +329,7 @@ export class PublishingService {
     if (confirmation !== expectedConfirmation) throw new PublicationError('Explicit retained-files finalization confirmation with the operation ID is required.', 400);
     return this.withLock(initial.productId, async () => {
       const operation = this.get(operationId);
+      if (this.isSuperseded(operation)) throw new PublicationError('This rollback was superseded by a newer publication checkpoint and cannot be finalized.', 409);
       if (operation.status !== 'conflict') throw new PublicationError('This operation is no longer eligible for rollback finalization.', 409);
       const readiness = await this.rollbackFinalizationReadiness(operation);
       if (!readiness.eligible || !readiness.evidence) throw new PublicationError(readiness.errors.join(' '), 409);
@@ -335,7 +347,9 @@ export class PublishingService {
     const errors: string[] = [];
     const generated = operation.items.map((item) => item.createdMediaId).filter((id): id is string => Boolean(id));
     if (operation.status !== 'conflict') errors.push('Only a conflicted operation can be finalized.');
-    if (operation.productId !== ABANDONMENT_TEST_PRODUCT_ID || operation.productTitle !== ABANDONMENT_TEST_PRODUCT_TITLE) errors.push('Only the designated disposable test product is eligible.');
+    const disposableTestProduct = operation.productId === ABANDONMENT_TEST_PRODUCT_ID && operation.productTitle === ABANDONMENT_TEST_PRODUCT_TITLE;
+    if (!disposableTestProduct && !this.allowedProductIds.has(operation.productId)) errors.push('The product is not the designated disposable test product or an explicitly allowlisted real product.');
+    if (this.isSuperseded(operation)) errors.push('A newer publication checkpoint supersedes this rollback.');
     if (operation.productRestored !== true) errors.push('Product restoration has not been recorded as complete.');
     if (!operation.items.length || operation.items.some((item) => item.status !== 'rolled_back')) errors.push('Every publication item must be rolled back.');
     if (!generated.length || generated.length !== operation.items.length || new Set(generated).size !== generated.length) errors.push('Generated media ownership records are incomplete or inconsistent.');
@@ -364,7 +378,8 @@ export class PublishingService {
 
     const [product, state] = await Promise.all([this.shopify.getProduct(operation.productId, false), this.shopify.getPublicationState(operation.productId)]);
     if (!state.complete) errors.push('Shopify returned an incomplete publication snapshot.');
-    if (product.id !== operation.productId || product.title !== ABANDONMENT_TEST_PRODUCT_TITLE || product.status.toUpperCase() !== 'DRAFT') errors.push('The live product identity does not match the designated disposable draft product.');
+    if (product.id !== operation.productId || product.title !== operation.productTitle) errors.push('The live Shopify product identity does not match the immutable operation.');
+    if (disposableTestProduct && product.status.toUpperCase() !== 'DRAFT') errors.push('The designated disposable test product is no longer Draft.');
     if (!same(state.mediaIds, operation.originalMediaOrder)) errors.push('Live product media IDs or ordering do not match the immutable original snapshot.');
     if (state.variants.length !== operation.originalVariantMedia.length) errors.push('The live variant set does not match the immutable original snapshot.');
     const originals = new Map(operation.originalVariantMedia.map((entry) => [entry.variantId, entry.mediaIds]));
@@ -482,8 +497,14 @@ export class PublishingService {
     for (const item of batch.items) {
       if (item.status !== 'success' || !item.preview || !item.sourceImageId) { errors.push(`${item.color}: generated preview or reliable source mapping is missing.`); continue; }
       const sourceImageId = item.sourceImageId; const variants = product.variants.filter((variant) => variant.color === item.color);
-      const source = product.images.find((img) => img.id === sourceImageId && img.association === 'reliable' && img.associatedColors.length === 1 && img.associatedColors[0] === item.color);
-      if (!source || !variants.length || variants.some((variant) => !variant.associatedImageIds.includes(sourceImageId))) { errors.push(`${item.color}: current Shopify variant mapping conflicts with the batch source.`); continue; }
+      if (item.sourceAsset?.kind === 'garment') {
+        try { const sourceBytes = (await this.assets.bytes('garment', item.sourceAsset.id)).buffer; if (!(await analyzeTransparency(sourceBytes)).isMeaningfullyTransparent) throw new Error('opaque'); }
+        catch { errors.push(`${item.color}: preserved transparent garment source is missing or invalid.`); continue; }
+      } else {
+        const source = product.images.find((img) => img.id === sourceImageId && img.association === 'reliable' && img.associatedColors.length === 1 && img.associatedColors[0] === item.color);
+        if (!source || variants.some((variant) => !variant.associatedImageIds.includes(sourceImageId))) { errors.push(`${item.color}: current Shopify variant mapping conflicts with the batch source.`); continue; }
+      }
+      if (!variants.length) { errors.push(`${item.color}: current Shopify variants no longer contain this color.`); continue; }
       try { await inspectImage((await this.assets.bytes('preview', item.preview.id)).buffer, ['png']); } catch { errors.push(`${item.color}: generated preview file is missing or invalid.`); continue; }
       colors.push({ color: item.color, variantIds: variants.map((v) => v.id), previewId: item.preview.id });
     }
@@ -523,7 +544,11 @@ export class PublishingService {
     throw new PublicationError('No complete publication checkpoint was found.', 409);
   }
   private blockingOperation(productId: string, allowedOperationId?: string) {
-    return this.list().find((operation) => operation.productId === productId && operation.id !== allowedOperationId && !TERMINAL_STATUSES.has(operation.status));
+    return this.list().find((operation) => operation.productId === productId && operation.id !== allowedOperationId && !NONBLOCKING_STATUSES.has(operation.status));
+  }
+  private latestOperation(productId: string) { return this.list().find((operation) => operation.productId === productId); }
+  private isSuperseded(operation: PublicationOperation) {
+    return this.list().some((candidate) => candidate.productId === operation.productId && candidate.predecessorOperationId === operation.id);
   }
   private async withLock<T>(productId: string, action: () => Promise<T>) { if (this.locks.has(productId)) throw new PublicationError('Another publication or rollback is already running for this product.', 409); this.locks.add(productId); try { return await action(); } finally { this.locks.delete(productId); } }
   private assertId(id: string) { if (!STRICT_UUID.test(id)) throw new PublicationError('Publication operation not found.', 404); }

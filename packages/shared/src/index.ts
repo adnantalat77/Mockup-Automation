@@ -65,6 +65,7 @@ export type BatchStatus = 'running' | 'completed' | 'partial' | 'cancelled';
 export interface MockupBatchItem {
   color: string;
   sourceImageId?: string;
+  sourceAsset?: ImageAsset;
   status: BatchItemStatus;
   reason?: string;
   attempts: number;
@@ -167,6 +168,7 @@ export interface PublicationOperation {
   updatedAt: string;
   status: PublicationStatus;
   publicationMode?: 'append_originals' | 'replace_gallery';
+  predecessorOperationId?: string;
   originalMediaOrder: string[];
   originalVariantMedia: Array<{ variantId: string; mediaIds: string[] }>;
   expectedPublishedMediaOrder: string[];

@@ -52,7 +52,7 @@ export class BatchService {
     if (this.active.size >= MAX_ACTIVE_BATCHES) throw new BatchError('Too many active batches. Wait for a running batch to finish.', 429);
     const [product] = await Promise.all([this.shopify.getProduct(productId, true), this.assets.get('background', backgroundId)]);
     if (product.colors.length > MAX_BATCH_ITEMS) throw new BatchError(`Products with more than ${MAX_BATCH_ITEMS} colors require manual review.`);
-    const items = this.mapItems(product);
+    const items = this.reusePreservedSources(productId, this.mapItems(product));
     const now = new Date().toISOString();
     const batch: MockupBatch = { id: crypto.randomUUID(), productId, productTitle: product.title, backgroundId, status: 'running', cancelRequested: false, createdAt: now, updatedAt: now, items, counts: this.counts(items) };
     this.records.set(batch.id, batch);
@@ -116,6 +116,17 @@ export class BatchService {
     });
   }
 
+  private reusePreservedSources(productId: string, items: MockupBatchItem[]) {
+    const previous = this.list().filter((batch) => batch.productId === productId);
+    for (const item of items) {
+      if (item.status !== 'skipped' || !item.reason?.startsWith('No single compatible')) continue;
+      const preserved = previous.flatMap((batch) => batch.items).find((candidate) => candidate.color === item.color && candidate.sourceImageId && candidate.sourceAsset?.kind === 'garment');
+      if (!preserved?.sourceAsset || !preserved.sourceImageId) continue;
+      item.sourceImageId = preserved.sourceImageId; item.sourceAsset = preserved.sourceAsset; item.status = 'queued'; item.reason = undefined;
+    }
+    return items;
+  }
+
   private async process(id: string, onlyColor?: string) {
     let batch = await this.get(id);
     const pending = batch.items.filter((item) => item.status === 'queued' && (!onlyColor || item.color === onlyColor));
@@ -149,12 +160,18 @@ export class BatchService {
 
   private async generateItem(batch: MockupBatch, item: MockupBatchItem) {
     if (!item.sourceImageId) throw new BatchError('Source image is missing.');
-    const product = await this.shopify.getProduct(batch.productId, false);
-    const source = product.images.find((image) => image.id === item.sourceImageId);
-    if (!source) throw new BatchError('The mapped Shopify source image is no longer available.');
-    const [background, garment] = await Promise.all([this.assets.bytes('background', batch.backgroundId), this.shopify.downloadImage(source.url)]);
+    const background = await this.assets.bytes('background', batch.backgroundId);
+    let garment: Buffer;
+    if (item.sourceAsset?.kind === 'garment') garment = (await this.assets.bytes('garment', item.sourceAsset.id)).buffer;
+    else {
+      const product = await this.shopify.getProduct(batch.productId, false);
+      const source = product.images.find((image) => image.id === item.sourceImageId);
+      if (!source) throw new BatchError('The mapped Shopify source image is no longer available.');
+      garment = await this.shopify.downloadImage(source.url);
+    }
     const inspected = await inspectImage(garment, ['png']);
     if (inspected.format !== 'png' || !(await analyzeTransparency(garment)).isMeaningfullyTransparent) throw new BatchError('The mapped source is no longer a compatible transparent PNG.');
+    if (!item.sourceAsset) item.sourceAsset = await this.assets.save('garment', garment, 'png', { originalName: `${batch.productTitle}-${item.color}-source.png`, width: inspected.width, height: inspected.height, hasTransparency: true });
     const output = await this.compositor(background.buffer, garment);
     const meta = await sharp(output).metadata();
     item.preview = await this.assets.save('preview', output, 'png', { originalName: `${batch.productTitle}-${item.color}.png`, width: meta.width!, height: meta.height! });

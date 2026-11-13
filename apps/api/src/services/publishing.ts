@@ -9,7 +9,7 @@ import type { ShopifyPublicationState, ShopifyService } from './shopify.js';
 
 const STRICT_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const STEP = (kind: string, color: string) => `${kind}:${color}`;
-type PublishingShopify = Pick<ShopifyService, 'getProduct' | 'getPublicationState' | 'stageImage' | 'createImageFile' | 'waitForFileReady' | 'addFileToProduct' | 'removeFileFromProduct' | 'appendVariantMedia' | 'detachVariantMedia' | 'reorderMedia' | 'deleteFile' | 'verifyFileDeletionSafe'>;
+type PublishingShopify = Pick<ShopifyService, 'getProduct' | 'getPublicationState' | 'stageImage' | 'createImageFile' | 'waitForFileReady' | 'addFileToProduct' | 'removeFileFromProduct' | 'replaceVariantMedia' | 'detachVariantMedia' | 'reorderMedia' | 'deleteFile' | 'verifyFileDeletionSafe'>;
 
 export class PublicationError extends Error { constructor(message: string, readonly status = 400) { super(message); } }
 const same = (left: string[], right: string[]) => left.length === right.length && left.every((value, index) => value === right[index]);
@@ -92,7 +92,7 @@ export class PublishingService {
             item.intent = undefined; operation!.completedSteps.push(STEP('product', item.color)); await this.checkpoint(operation!);
           }
           if (!operation!.completedSteps.includes(STEP('variants', item.color))) {
-            await this.intent(operation!, item, 'append_variants'); await this.shopify.appendVariantMedia(operation!.productId, mediaId, item.variantIds);
+            await this.intent(operation!, item, 'replace_variants'); await this.shopify.replaceVariantMedia(operation!.productId, mediaId, item.variantIds);
             item.intent = undefined; operation!.completedSteps.push(STEP('variants', item.color)); await this.checkpoint(operation!);
           }
           item.status = 'associated'; item.error = undefined; await this.checkpoint(operation!);
@@ -125,8 +125,25 @@ export class PublishingService {
       for (const item of [...operation.items].reverse()) {
         if (!item.createdMediaId || (item.status === 'rolled_back' && !item.cleanupPending)) continue;
         try {
-          const mediaId = item.createdMediaId; const liveVariantIds = current.variants.filter((v) => v.mediaIds.includes(mediaId)).map((v) => v.id);
-          if (liveVariantIds.length) { await this.intent(operation, item, 'detach_variants'); await this.shopify.detachVariantMedia(operation.productId, mediaId, liveVariantIds); item.intent = undefined; operation.completedSteps.push(STEP('detached', item.color)); await this.checkpoint(operation); }
+          const mediaId = item.createdMediaId;
+          const originalByMedia = new Map<string, string[]>(); const originallyUnassigned: string[] = [];
+          for (const variantId of item.variantIds) {
+            const original = operation.originalVariantMedia.find((variant) => variant.variantId === variantId)?.mediaIds ?? [];
+            if (original.length > 1) return this.markConflict(operation, `${item.color}: original variant ${variantId} has multiple media associations and cannot be restored automatically.`);
+            if (!original.length) originallyUnassigned.push(variantId);
+            else originalByMedia.set(original[0], [...(originalByMedia.get(original[0]) ?? []), variantId]);
+          }
+          for (const [originalMediaId, variantIds] of originalByMedia) {
+            const step = `restored-variants:${item.color}:${originalMediaId}`;
+            if (operation.completedSteps.includes(step)) continue;
+            const restoredCount = variantIds.filter((variantId) => same(current.variants.find((variant) => variant.id === variantId)?.mediaIds ?? [], [originalMediaId])).length;
+            if (restoredCount === variantIds.length) { operation.completedSteps.push(step); await this.checkpoint(operation); continue; }
+            if (restoredCount > 0) return this.markConflict(operation, `${item.color}: only some variants reflect the original media association; manual review is required.`);
+            await this.intent(operation, item, 'restore_variants'); await this.shopify.replaceVariantMedia(operation.productId, originalMediaId, variantIds);
+            item.intent = undefined; operation.completedSteps.push(step); await this.checkpoint(operation);
+          }
+          const stillGenerated = current.variants.filter((variant) => originallyUnassigned.includes(variant.id) && variant.mediaIds.includes(mediaId)).map((variant) => variant.id);
+          if (stillGenerated.length) { await this.intent(operation, item, 'detach_variants'); await this.shopify.detachVariantMedia(operation.productId, mediaId, stillGenerated); item.intent = undefined; operation.completedSteps.push(STEP('detached', item.color)); await this.checkpoint(operation); }
           if (current.mediaIds.includes(mediaId)) { await this.intent(operation, item, 'remove_product_reference'); await this.shopify.removeFileFromProduct(mediaId, operation.productId); item.intent = undefined; operation.completedSteps.push(STEP('removed-reference', item.color)); await this.checkpoint(operation); }
           const deletion = await this.shopify.verifyFileDeletionSafe(mediaId, operation.productId);
           if (!deletion.safe) {
@@ -156,7 +173,9 @@ export class PublishingService {
     const live = await this.shopify.getPublicationState(operation.productId); const conflict = this.compareExpected(operation, live, 'publish-retry'); if (conflict) return conflict;
     for (const item of operation.items) {
       if (!item.createdMediaId) continue; const onProduct = live.mediaIds.includes(item.createdMediaId);
-      const associated = item.variantIds.every((id) => live.variants.find((v) => v.id === id)?.mediaIds.includes(item.createdMediaId!));
+      const associatedCount = item.variantIds.filter((id) => same(live.variants.find((v) => v.id === id)?.mediaIds ?? [], [item.createdMediaId!])).length;
+      if (associatedCount > 0 && associatedCount < item.variantIds.length) return `${item.color}: only some intended variants have the generated media; manual review is required.`;
+      const associated = associatedCount === item.variantIds.length;
       if (onProduct && !operation.completedSteps.includes(STEP('product', item.color))) operation.completedSteps.push(STEP('product', item.color));
       if (associated && !operation.completedSteps.includes(STEP('variants', item.color))) operation.completedSteps.push(STEP('variants', item.color));
       if (associated) item.status = 'associated';
@@ -176,14 +195,17 @@ export class PublishingService {
     if (mode === 'published' && !same(live.mediaIds, operation.expectedPublishedMediaOrder)) return 'published media ordering does not match the recorded order.';
     const originals = new Map(operation.originalVariantMedia.map((entry) => [entry.variantId, entry.mediaIds]));
     for (const variant of live.variants) {
-      const expected = [...(originals.get(variant.id) ?? [])];
-      for (const item of operation.items) {
-        if (!item.variantIds.includes(variant.id) || !item.createdMediaId) continue;
-        const expectCreated = mode === 'published' || (mode === 'publish-retry' && (operation.completedSteps.includes(STEP('variants', item.color)) || (item.intent === 'append_variants' && variant.mediaIds.includes(item.createdMediaId)))) ||
-          (mode === 'rollback' && variant.mediaIds.includes(item.createdMediaId));
-        if (expectCreated) expected.push(item.createdMediaId);
-      }
-      if (!same(variant.mediaIds, expected)) return `variant ${variant.id} media changed externally.`;
+      const original = [...(originals.get(variant.id) ?? [])];
+      const item = operation.items.find((candidate) => candidate.variantIds.includes(variant.id) && candidate.createdMediaId);
+      if (!item?.createdMediaId) { if (!same(variant.mediaIds, original)) return `variant ${variant.id} media changed externally.`; continue; }
+      const generated = [item.createdMediaId];
+      if (mode === 'published') { if (!same(variant.mediaIds, generated)) return `variant ${variant.id} media changed externally.`; continue; }
+      if (mode === 'rollback') { if (!same(variant.mediaIds, original) && !same(variant.mediaIds, generated)) return `variant ${variant.id} media changed externally.`; continue; }
+      const replacementRecorded = operation.completedSteps.includes(STEP('variants', item.color));
+      const replacementPending = item.intent === 'replace_variants' || item.intent === 'append_variants';
+      if (replacementRecorded) { if (!same(variant.mediaIds, generated)) return `variant ${variant.id} media changed externally.`; }
+      else if (replacementPending) { if (!same(variant.mediaIds, original) && !same(variant.mediaIds, generated)) return `variant ${variant.id} media changed externally.`; }
+      else if (!same(variant.mediaIds, original)) return `variant ${variant.id} media changed externally.`;
     }
     if (live.variants.length !== operation.originalVariantMedia.length) return 'the product variant set changed externally.';
     return undefined;

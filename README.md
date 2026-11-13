@@ -70,7 +70,9 @@ Before publishing, the API completely paginates product media, variants, and eac
 
 If startup finds a persisted `create_file` intent without a checkpointed Shopify media ID, the operation is marked as an uncertain-creation conflict. Neither restart recovery nor a partial-operation retry repeats `fileCreate`; manual reconciliation is required to locate and establish ownership of any file Shopify may have created.
 
-The Shopify workflow uses staged uploads, `fileCreate`, file-processing polling, `fileUpdate` product references, `productVariantAppendMedia`/`productVariantDetachMedia`, `productReorderMedia`, and `fileDelete`. It does not use deprecated `productDeleteMedia`. See [docs/PHASE4_LIVE_TEST.md](docs/PHASE4_LIVE_TEST.md) before any separately approved live test.
+The Shopify workflow uses staged uploads, `fileCreate`, file-processing polling, `fileUpdate` product references, `productVariantsBulkUpdate`, `productVariantDetachMedia` for originally unassigned variants, `productReorderMedia`, and guarded `fileDelete`. It does not use deprecated `productDeleteMedia`. See [docs/PHASE4_LIVE_TEST.md](docs/PHASE4_LIVE_TEST.md) before any separately approved live test.
+
+Variant publishing uses `productVariantsBulkUpdate` with `mediaId` and `allowPartialUpdates: false`. This replaces an existing variant image association instead of attempting to append a second association. The immutable pre-publication variant-media snapshot remains the rollback source of truth; rollback restores each original `mediaId` before removing the generated product reference.
 
 Published ordering is deterministic: all original media remain in their original order, followed by generated media in batch color order. The API verifies this ordering after Shopify's asynchronous reorder job. Checkpoints are written to uniquely named temporary files and atomically renamed; startup ignores temporary or malformed files and recovers the newest structurally valid checkpoint.
 

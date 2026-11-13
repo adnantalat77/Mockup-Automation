@@ -36,11 +36,13 @@ async function fixture(overrides: Record<string, unknown> = {}) {
     createImageFile: vi.fn().mockResolvedValue({ id: 'gid://shopify/MediaImage/99', fileStatus: 'PROCESSING' }),
     waitForFileReady: vi.fn().mockResolvedValue(undefined), addFileToProduct: vi.fn().mockImplementation(async (id: string) => { if (!live.mediaIds.includes(id)) live.mediaIds.push(id); }),
     removeFileFromProduct: vi.fn().mockResolvedValue(undefined), appendVariantMedia: vi.fn().mockResolvedValue(undefined),
+    replaceVariantMedia: vi.fn().mockResolvedValue(undefined),
     detachVariantMedia: vi.fn().mockResolvedValue(undefined), reorderMedia: vi.fn().mockImplementation(async (_id: string, ids: string[]) => { live.mediaIds = [...ids]; }), deleteFile: vi.fn().mockResolvedValue(undefined),
     verifyFileDeletionSafe: vi.fn().mockResolvedValue({ safe: true, reason: 'operation-owned' }),
     ...overrides
   };
   api.appendVariantMedia.mockImplementation(async (_productId: string, mediaId: string, variantIds: string[]) => { for (const variant of live.variants) if (variantIds.includes(variant.id) && !variant.mediaIds.includes(mediaId)) variant.mediaIds.push(mediaId); });
+  api.replaceVariantMedia.mockImplementation(async (_productId: string, mediaId: string, variantIds: string[]) => { for (const variant of live.variants) if (variantIds.includes(variant.id)) variant.mediaIds = [mediaId]; });
   api.detachVariantMedia.mockImplementation(async (_productId: string, mediaId: string, variantIds: string[]) => { for (const variant of live.variants) if (variantIds.includes(variant.id)) variant.mediaIds = variant.mediaIds.filter((id) => id !== mediaId); });
   api.removeFileFromProduct.mockImplementation(async (mediaId: string) => { live.mediaIds = live.mediaIds.filter((id) => id !== mediaId); });
   const publishing = new PublishingService(root, assets, batches, api as any); await publishing.init();
@@ -53,7 +55,8 @@ describe('PublishingService', () => {
     await expect(publishing.validate(batch.id)).resolves.toMatchObject({ ready: true, imageCount: 1, variantCount: 2 });
     const operation = await publishing.publish(batch.id);
     expect(operation.status).toBe('published');
-    expect(api.appendVariantMedia).toHaveBeenCalledWith(product.id, 'gid://shopify/MediaImage/99', product.variants.map((variant) => variant.id));
+    expect(api.replaceVariantMedia).toHaveBeenCalledWith(product.id, 'gid://shopify/MediaImage/99', product.variants.map((variant) => variant.id));
+    expect(api.appendVariantMedia).not.toHaveBeenCalled();
   });
 
   it('prevents duplicate publication of a completed operation', async () => {
@@ -94,7 +97,8 @@ describe('PublishingService', () => {
     const published = await publishing.publish(batch.id);
     const rolledBack = await publishing.rollback(published.id);
     expect(rolledBack.status).toBe('rolled_back');
-    expect(api.detachVariantMedia).toHaveBeenCalled(); expect(api.deleteFile).toHaveBeenCalledWith('gid://shopify/MediaImage/99');
+    expect(api.detachVariantMedia).not.toHaveBeenCalled(); expect(api.deleteFile).toHaveBeenCalledWith('gid://shopify/MediaImage/99');
+    expect(api.replaceVariantMedia).toHaveBeenLastCalledWith(product.id, 'gid://shopify/MediaImage/50', product.variants.map((variant) => variant.id));
     expect(api.reorderMedia).toHaveBeenCalledWith(product.id, ['gid://shopify/MediaImage/50']);
   });
 
@@ -150,12 +154,49 @@ describe('PublishingService', () => {
 
   it('reconciles live state before retrying a partial association', async () => {
     const { batch, publishing, api, live } = await fixture();
-    api.appendVariantMedia.mockRejectedValueOnce(new Error('temporary failure')).mockImplementation(async (_productId: string, mediaId: string, variantIds: string[]) => {
-      for (const variant of live.variants) if (variantIds.includes(variant.id) && !variant.mediaIds.includes(mediaId)) variant.mediaIds.push(mediaId);
+    api.replaceVariantMedia.mockRejectedValueOnce(new Error('temporary failure')).mockImplementation(async (_productId: string, mediaId: string, variantIds: string[]) => {
+      for (const variant of live.variants) if (variantIds.includes(variant.id)) variant.mediaIds = [mediaId];
     });
     await expect(publishing.publish(batch.id)).resolves.toMatchObject({ status: 'partial' });
+    const partial = publishing.list()[0]; partial.items[0].intent = 'append_variants';
     await expect(publishing.publish(batch.id)).resolves.toMatchObject({ status: 'published' });
     expect(api.createImageFile).toHaveBeenCalledOnce();
+    expect(api.addFileToProduct).toHaveBeenCalledOnce();
+  });
+
+  it('reconciles an interrupted successful replacement without repeating the mutation', async () => {
+    const { batch, publishing, api, live } = await fixture();
+    api.replaceVariantMedia.mockImplementationOnce(async (_productId: string, mediaId: string, variantIds: string[]) => {
+      for (const variant of live.variants) if (variantIds.includes(variant.id)) variant.mediaIds = [mediaId];
+      throw new Error('connection lost after replacement');
+    });
+    await expect(publishing.publish(batch.id)).resolves.toMatchObject({ status: 'partial', items: [{ intent: 'replace_variants' }] });
+    await expect(publishing.publish(batch.id)).resolves.toMatchObject({ status: 'published' });
+    expect(api.replaceVariantMedia).toHaveBeenCalledOnce();
+    expect(api.createImageFile).toHaveBeenCalledOnce();
+  });
+
+  it('blocks recovery when only some variants reflect a pending replacement', async () => {
+    const { batch, publishing, api, live } = await fixture();
+    api.replaceVariantMedia.mockImplementationOnce(async (_productId: string, mediaId: string) => {
+      live.variants[0].mediaIds = [mediaId];
+      throw new Error('partial state observed');
+    });
+    await expect(publishing.publish(batch.id)).resolves.toMatchObject({ status: 'partial' });
+    await expect(publishing.publish(batch.id)).resolves.toMatchObject({ status: 'conflict' });
+    expect(api.replaceVariantMedia).toHaveBeenCalledOnce();
+  });
+
+  it('reconciles an interrupted rollback replacement without repeating it', async () => {
+    const { batch, publishing, api, live } = await fixture();
+    const published = await publishing.publish(batch.id);
+    api.replaceVariantMedia.mockImplementationOnce(async (_productId: string, mediaId: string, variantIds: string[]) => {
+      for (const variant of live.variants) if (variantIds.includes(variant.id)) variant.mediaIds = [mediaId];
+      throw new Error('connection lost after original association was restored');
+    });
+    await expect(publishing.rollback(published.id)).resolves.toMatchObject({ status: 'rollback_partial' });
+    await expect(publishing.rollback(published.id)).resolves.toMatchObject({ status: 'rolled_back' });
+    expect(api.replaceVariantMedia).toHaveBeenCalledTimes(2);
   });
 
   it('safely retries failures before staging and product-reference mutation boundaries', async () => {

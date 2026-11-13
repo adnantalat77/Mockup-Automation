@@ -208,6 +208,7 @@ export class ShopifyService {
         product(id: $id) {
           media(first: 100, after: $after) { nodes { id } pageInfo { hasNextPage endCursor } }
         }
+      }
       `, { id: productId, after: mediaCursor });
       if (!data.product) throw new ShopifyError('Shopify product not found.', 404, 'NOT_FOUND');
       mediaIds.push(...data.product.media.nodes.map((node) => node.id));
@@ -325,6 +326,21 @@ export class ShopifyService {
       }
     `, { productId, variantMedia: variantIds.map((variantId) => ({ variantId, mediaIds: [mediaId] })) });
     this.assertUserErrors(result.productVariantAppendMedia.userErrors);
+  }
+
+  async replaceVariantMedia(productId: string, mediaId: string, variantIds: string[]) {
+    this.assertProductId(productId); this.assertMediaId(mediaId); variantIds.forEach((id) => this.assertVariantId(id));
+    const result = await this.graphql<{ productVariantsBulkUpdate: { productVariants: Array<{ id: string }> | null; userErrors: Array<{ message: string }> } }>(`
+      mutation ReplaceVariantMedia($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+        productVariantsBulkUpdate(productId: $productId, variants: $variants, allowPartialUpdates: false) {
+          productVariants { id }
+          userErrors { message }
+        }
+      }
+    `, { productId, variants: variantIds.map((id) => ({ id, mediaId })) });
+    this.assertUserErrors(result.productVariantsBulkUpdate.userErrors);
+    const updated = new Set(result.productVariantsBulkUpdate.productVariants?.map((variant) => variant.id) ?? []);
+    if (variantIds.some((id) => !updated.has(id))) throw new ShopifyError('Shopify did not confirm every variant media replacement.', 502, 'VARIANT_MEDIA_REPLACEMENT_FAILED');
   }
 
   async detachVariantMedia(productId: string, mediaId: string, variantIds: string[]) {

@@ -92,7 +92,7 @@ export interface PublicationItem {
   variantIds: string[];
   createdMediaId?: string;
   stagedResourceUrl?: string;
-  intent?: 'stage_upload' | 'create_file' | 'add_product_reference' | 'append_variants' | 'reorder_published' | 'detach_variants' | 'remove_product_reference' | 'delete_file' | 'restore_order';
+  intent?: 'stage_upload' | 'create_file' | 'add_product_reference' | 'append_variants' | 'replace_variants' | 'restore_variants' | 'reorder_published' | 'detach_variants' | 'remove_product_reference' | 'delete_file' | 'restore_order';
   uncertainCreation?: boolean;
   cleanupPending?: boolean;
   status: 'pending' | 'uploaded' | 'associated' | 'failed' | 'rolled_back';

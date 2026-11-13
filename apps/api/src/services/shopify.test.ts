@@ -1,10 +1,30 @@
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
+import { parse } from 'graphql';
+import ts from 'typescript';
 import { ShopifyError, ShopifyService } from './shopify.js';
 
 const config = { shopDomain: 'equipd-wear.myshopify.com', clientId: 'client-id', clientSecret: 'client-secret', apiVersion: '2026-10' };
 const json = (value: unknown, status = 200, headers?: Record<string, string>) => new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json', ...headers } });
 
 describe('ShopifyService', () => {
+  it('contains only syntactically valid GraphQL document literals', () => {
+    const filename = fileURLToPath(new URL('./shopify.ts', import.meta.url));
+    const source = ts.createSourceFile(filename, readFileSync(filename, 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+    const documents: string[] = [];
+    const visit = (node: ts.Node) => {
+      if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === 'graphql') {
+        const document = node.arguments[0];
+        if (document && ts.isNoSubstitutionTemplateLiteral(document)) documents.push(document.text);
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(source);
+    expect(documents.length).toBeGreaterThanOrEqual(15);
+    for (const document of documents) expect(() => parse(document)).not.toThrow();
+  });
+
   it('uses client credentials, verifies scopes, and caches the token', async () => {
     const fetcher = vi.fn()
       .mockResolvedValueOnce(json({ access_token: 'secret-token', expires_in: 3600 }))
@@ -80,12 +100,28 @@ describe('ShopifyService', () => {
     expect(state).toMatchObject({ complete: true, mediaIds: ['gid://shopify/MediaImage/1', 'gid://shopify/MediaImage/2'] });
     expect(state.variants[0].mediaIds).toEqual(['gid://shopify/MediaImage/1', 'gid://shopify/MediaImage/2']);
     expect(JSON.parse(fetcher.mock.calls[6][1].body).variables.after).toBe('vm2');
+    const sentDocuments = fetcher.mock.calls.slice(1).map((call) => JSON.parse(call[1].body).query as string);
+    expect(sentDocuments.some((document) => document.includes('query PublicationMedia'))).toBe(true);
+    for (const document of sentDocuments) expect(() => parse(document)).not.toThrow();
   });
 
   it('fails safely when a publication cursor cannot advance', async () => {
     const fetcher = vi.fn().mockResolvedValueOnce(json({ access_token: 'token', expires_in: 3600 }))
       .mockResolvedValueOnce(json({ data: { product: { media: { nodes: [], pageInfo: { hasNextPage: true, endCursor: null } } } } }));
     await expect(new ShopifyService(config, fetcher as unknown as typeof fetch).getPublicationState('gid://shopify/Product/123')).rejects.toMatchObject({ code: 'INCOMPLETE_SNAPSHOT' });
+  });
+
+  it('replaces existing variant media with productVariantsBulkUpdate and disables partial updates', async () => {
+    const variantIds = ['gid://shopify/ProductVariant/1', 'gid://shopify/ProductVariant/2'];
+    const fetcher = vi.fn().mockResolvedValueOnce(json({ access_token: 'token', expires_in: 3600 })).mockResolvedValueOnce(json({ data: {
+      productVariantsBulkUpdate: { productVariants: variantIds.map((id) => ({ id })), userErrors: [] }
+    } }));
+    const service = new ShopifyService(config, fetcher as unknown as typeof fetch);
+    await service.replaceVariantMedia('gid://shopify/Product/123', 'gid://shopify/MediaImage/99', variantIds);
+    const body = JSON.parse(fetcher.mock.calls[1][1].body);
+    expect(body.query).toContain('productVariantsBulkUpdate');
+    expect(body.query).toContain('allowPartialUpdates: false');
+    expect(body.variables.variants).toEqual(variantIds.map((id) => ({ id, mediaId: 'gid://shopify/MediaImage/99' })));
   });
 
   it('refreshes an expired token once after a 401', async () => {

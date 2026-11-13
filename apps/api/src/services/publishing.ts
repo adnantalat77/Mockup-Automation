@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { mkdir, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import type { MockupBatch, PublicationItem, PublicationOperation, PublishReadiness } from '@mockup-automation/shared';
+import type { AbandonReadiness, AbandonmentEvidence, MockupBatch, PublicationItem, PublicationOperation, PublishReadiness } from '@mockup-automation/shared';
 import { inspectImage } from './images.js';
 import { AssetStore } from './storage.js';
 import { BatchService } from './batches.js';
@@ -9,6 +9,9 @@ import type { ShopifyPublicationState, ShopifyService } from './shopify.js';
 
 const STRICT_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const STEP = (kind: string, color: string) => `${kind}:${color}`;
+export const ABANDONMENT_TEST_PRODUCT_ID = 'gid://shopify/Product/15608846975264';
+const ABANDONMENT_TEST_PRODUCT_TITLE = 'Mockup Automation - TEST ONLY';
+const TERMINAL_STATUSES = new Set(['rolled_back', 'abandoned']);
 type PublishingShopify = Pick<ShopifyService, 'getProduct' | 'getPublicationState' | 'stageImage' | 'createImageFile' | 'waitForFileReady' | 'addFileToProduct' | 'removeFileFromProduct' | 'replaceVariantMedia' | 'detachVariantMedia' | 'reorderMedia' | 'deleteFile' | 'verifyFileDeletionSafe'>;
 
 export class PublicationError extends Error { constructor(message: string, readonly status = 400) { super(message); } }
@@ -49,16 +52,25 @@ export class PublishingService {
   get(id: string) { this.assertId(id); const operation = this.records.get(id); if (!operation) throw new PublicationError('Publication operation not found.', 404); return operation; }
   async validate(batchId: string): Promise<PublishReadiness> {
     const { batch, errors, colors } = await this.preflight(batchId);
+    const resumable = this.list().find((operation) => operation.batchId === batchId && operation.status === 'partial');
+    const blocker = this.blockingOperation(batch.productId, resumable?.id);
+    if (blocker) errors.push(`Publication operation ${blocker.id} must be rolled back or abandoned before a fresh publication.`);
     return { ready: !errors.length, batchId, productId: batch.productId, imageCount: colors.length, variantCount: colors.reduce((sum, item) => sum + item.variantIds.length, 0), colors: colors.map(({ color, variantIds, previewId }) => ({ color, variantCount: variantIds.length, previewId })), errors };
   }
 
   async publish(batchId: string) {
-    const existing = this.list().find((op) => op.batchId === batchId && op.status !== 'rolled_back');
+    const existing = this.list().find((op) => op.batchId === batchId && !TERMINAL_STATUSES.has(op.status));
     if (existing && existing.status !== 'partial') throw new PublicationError('This batch already has a publication operation.', 409);
+    if (existing) {
+      const blocker = this.blockingOperation(existing.productId, existing.id);
+      if (blocker) throw new PublicationError(`Publication operation ${blocker.id} must be rolled back or abandoned before this publication can continue.`, 409);
+    }
     let operation = existing;
     if (!operation) {
       const context = await this.preflight(batchId);
       if (context.errors.length) throw new PublicationError(context.errors.join(' '), 409);
+      const blocker = this.blockingOperation(context.batch.productId);
+      if (blocker) throw new PublicationError(`Publication operation ${blocker.id} must be rolled back or abandoned before a fresh publication.`, 409);
       const now = new Date().toISOString();
       operation = { id: crypto.randomUUID(), version: 1, batchId, productId: context.batch.productId, productTitle: context.batch.productTitle,
         createdAt: now, updatedAt: now, status: 'validated', originalMediaOrder: [...context.state.mediaIds],
@@ -168,6 +180,55 @@ export class PublishingService {
     });
   }
 
+  async validateAbandonment(operationId: string): Promise<AbandonReadiness> {
+    const operation = this.get(operationId);
+    if (operation.status === 'abandoned') return { eligible: true, alreadyAbandoned: true, operationId, productId: operation.productId, errors: [], evidence: operation.abandonmentEvidence };
+    return this.abandonmentReadiness(operation);
+  }
+
+  async abandon(operationId: string, reason: string) {
+    const operation = this.get(operationId);
+    if (operation.status === 'abandoned') return operation;
+    if (reason.trim().length < 10 || reason.length > 500) throw new PublicationError('Provide an abandonment reason between 10 and 500 characters.', 400);
+    return this.withLock(operation.productId, async () => {
+      if (operation.status === 'abandoned') return operation;
+      const readiness = await this.abandonmentReadiness(operation);
+      if (!readiness.eligible || !readiness.evidence) throw new PublicationError(readiness.errors.join(' '), 409);
+      operation.status = 'abandoned'; operation.abandonedAt = new Date().toISOString(); operation.abandonmentReason = reason.trim();
+      operation.abandonmentEvidence = readiness.evidence; operation.errors = [...operation.errors, `Operation abandoned after verified manual restoration: ${reason.trim()}`];
+      await this.checkpoint(operation); return operation;
+    });
+  }
+
+  private async abandonmentReadiness(operation: PublicationOperation): Promise<AbandonReadiness> {
+    const errors: string[] = [];
+    if (operation.productId !== ABANDONMENT_TEST_PRODUCT_ID) errors.push('Only the designated disposable Phase 4 test product can be abandoned.');
+    if (!['partial', 'conflict', 'rollback_partial'].includes(operation.status)) errors.push('Only a partial or conflicted test publication can be abandoned.');
+    if (errors.length) return { eligible: false, operationId: operation.id, productId: operation.productId, errors };
+    const [product, state] = await Promise.all([this.shopify.getProduct(operation.productId, false), this.shopify.getPublicationState(operation.productId)]);
+    if (!state.complete) errors.push('Shopify returned an incomplete publication snapshot.');
+    if (product.id !== ABANDONMENT_TEST_PRODUCT_ID || product.title !== ABANDONMENT_TEST_PRODUCT_TITLE || product.status.toUpperCase() !== 'DRAFT') errors.push('The operation does not target the designated disposable draft product.');
+    if (!same(state.mediaIds, operation.originalMediaOrder)) errors.push('Current product media IDs or ordering do not exactly match the immutable original snapshot.');
+    const originals = new Map(operation.originalVariantMedia.map((entry) => [entry.variantId, entry.mediaIds]));
+    if (state.variants.length !== operation.originalVariantMedia.length) errors.push('The current variant set does not match the immutable original snapshot.');
+    for (const variant of state.variants) {
+      const original = originals.get(variant.id);
+      if (!original || !same(variant.mediaIds, original)) errors.push(`Variant ${variant.id} is missing or its media association changed.`);
+    }
+    for (const original of operation.originalVariantMedia) if (!state.variants.some((variant) => variant.id === original.variantId)) errors.push(`Original variant ${original.variantId} is missing.`);
+    const generated = operation.items.map((item) => item.createdMediaId).filter((id): id is string => Boolean(id));
+    const generatedOnProduct = generated.filter((id) => state.mediaIds.includes(id));
+    const generatedOnVariants = state.variants.flatMap((variant) => variant.mediaIds.filter((id) => generated.includes(id)).map((id) => `${variant.id}:${id}`));
+    if (generatedOnProduct.length) errors.push(`Generated media remains attached to the product: ${generatedOnProduct.join(', ')}.`);
+    if (generatedOnVariants.length) errors.push(`Generated media remains attached to variants: ${generatedOnVariants.join(', ')}.`);
+    const evidence: AbandonmentEvidence | undefined = errors.length ? undefined : {
+      verifiedAt: new Date().toISOString(), productId: product.id, productTitle: product.title, productStatus: product.status,
+      mediaIds: [...state.mediaIds], variantAssociations: state.variants.map((variant) => ({ variantId: variant.id, mediaIds: [...variant.mediaIds] })),
+      generatedMediaIdsChecked: generated, snapshotComplete: true
+    };
+    return { eligible: errors.length === 0, operationId: operation.id, productId: operation.productId, errors, evidence };
+  }
+
   private async reconcilePublication(operation: PublicationOperation) {
     if (operation.items.some((item) => item.uncertainCreation || (item.intent === 'create_file' && !item.createdMediaId))) return 'A fileCreate result is uncertain; manual ownership reconciliation is required and fileCreate will not be retried.';
     const live = await this.shopify.getPublicationState(operation.productId); const conflict = this.compareExpected(operation, live, 'publish-retry'); if (conflict) return conflict;
@@ -247,6 +308,9 @@ export class PublishingService {
       if (validOperation(parsed) && parsed.id === id) return parsed;
     } catch { /* fall back to the previous complete checkpoint */ } }
     throw new PublicationError('No complete publication checkpoint was found.', 409);
+  }
+  private blockingOperation(productId: string, allowedOperationId?: string) {
+    return this.list().find((operation) => operation.productId === productId && operation.id !== allowedOperationId && !TERMINAL_STATUSES.has(operation.status));
   }
   private async withLock<T>(productId: string, action: () => Promise<T>) { if (this.locks.has(productId)) throw new PublicationError('Another publication or rollback is already running for this product.', 409); this.locks.add(productId); try { return await action(); } finally { this.locks.delete(productId); } }
   private assertId(id: string) { if (!STRICT_UUID.test(id)) throw new PublicationError('Publication operation not found.', 404); }

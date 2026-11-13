@@ -76,6 +76,10 @@ Variant publishing uses `productVariantsBulkUpdate` with `mediaId` and `allowPar
 
 Published ordering is deterministic: all original media remain in their original order, followed by generated media in batch color order. The API verifies this ordering after Shopify's asynchronous reorder job. Checkpoints are written to uniquely named temporary files and atomically renamed; startup ignores temporary or malformed files and recovers the newest structurally valid checkpoint.
 
+### Disposable Phase 4 test reset
+
+`Abandon Partial Operation` is hard-coded to the draft product `gid://shopify/Product/15608846975264` titled `Mockup Automation - TEST ONLY`. It is a metadata-only terminal action. Before enabling confirmation, the backend retrieves a complete live snapshot and requires exact equality with the operation's original product-media order, variant IDs, and variant-media associations, plus absence of every operation-created media ID from the product and variants. It never deletes Shopify Files. Each verified abandonment adds an immutable checkpoint containing the timestamp, reason, and verification evidence. Every nonterminal operation on the product must be individually abandoned or rolled back before a fresh publication is allowed.
+
 ## Safety and current limitations
 
 - Shopify publishing is disabled by default and has not been exercised against a live store by the automated test suite. Product search remains available with `read_products` only.

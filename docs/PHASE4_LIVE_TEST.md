@@ -14,3 +14,5 @@ Do not run this procedure against a production product without a separate, expli
 10. Immediately set `SHOPIFY_PUBLISHING_ENABLED=false`, clear the authorization secret, restart the API, and remove the temporary app write scopes if they are no longer needed.
 
 If any step reports `partial`, `rollback_partial`, or `conflict`, stop. Preserve the checkpoint directory, inspect the current Shopify product state, and resolve the discrepancy manually before retrying. Never delete media merely because its filename resembles a generated mockup.
+
+For the designated disposable product only, a manually restored partial attempt can be terminally recorded through **Verify for Abandonment**. Select the exact history entry, review the read-only verification result, then type `ABANDON <operation ID>` and provide a reason. Repeat independently for every old operation. Do not start a new batch until all prior operations for the product show `abandoned` or `rolled_back`. Abandonment does not delete residual files from Shopify Content → Files.

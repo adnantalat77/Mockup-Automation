@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { ApiError, ImageAsset, MockupBatch, PublicationOperation, PublishReadiness, ShopifyProductDetail, ShopifyProductSummary, ShopifyStatus } from '@mockup-automation/shared';
+import type { AbandonReadiness, ApiError, ImageAsset, MockupBatch, PublicationOperation, PublishReadiness, ShopifyProductDetail, ShopifyProductSummary, ShopifyStatus } from '@mockup-automation/shared';
+import { validateAndRefreshHistory } from './publishing-state.js';
 
 // Development stays same-origin through Vite's /api proxy. A production host
 // can provide VITE_API_URL when the deployed API has a separate origin.
 const apiBase = import.meta.env.PROD ? (import.meta.env.VITE_API_URL ?? '').replace(/\/$/, '') : '';
+const abandonmentTestProductId = 'gid://shopify/Product/15608846975264';
 
 async function upload(path: string, file: File): Promise<ImageAsset> {
   const body = new FormData(); body.append('image', file);
@@ -152,31 +154,66 @@ function PublishingPanel({ batch, product }: { batch?: MockupBatch; product?: Sh
   const [history, setHistory] = useState<PublicationOperation[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [historyError, setHistoryError] = useState('');
+  const [abandonReview, setAbandonReview] = useState<{ operation: PublicationOperation; readiness: AbandonReadiness }>();
 
   useEffect(() => { void apiJson<{ enabled: boolean; reason?: string }>('/api/publishing/status').then(setStatus); }, []);
   const authorized = (path: string, init: RequestInit = {}) => apiJson<any>(path, { ...init, headers: { 'Content-Type': 'application/json', 'X-Publish-Authorization': authorization, ...(init.headers ?? {}) } });
   async function refreshHistory() { if (authorization) setHistory(await authorized('/api/publishing/operations')); }
-  async function validate() { if (!batch) return; setBusy(true); setError(''); try { setReadiness(await authorized('/api/publishing/validate', { method: 'POST', body: JSON.stringify({ batchId: batch.id }) })); await refreshHistory(); } catch (cause) { setError(cause instanceof Error ? cause.message : 'Validation failed.'); } finally { setBusy(false); } }
+  async function refreshHistorySafely() { try { await refreshHistory(); setHistoryError(''); } catch (cause) { setHistoryError(cause instanceof Error ? cause.message : 'Publication history could not be refreshed.'); } }
+  async function validate() {
+    if (!batch) return; setBusy(true); setError(''); setHistoryError('');
+    try {
+      const result = await validateAndRefreshHistory(
+        () => authorized('/api/publishing/validate', { method: 'POST', body: JSON.stringify({ batchId: batch.id }) }),
+        () => authorized('/api/publishing/operations')
+      );
+      setReadiness(result.readiness); if (result.history) setHistory(result.history); setHistoryError(result.historyError ?? '');
+    } catch (cause) { setReadiness(undefined); setError(cause instanceof Error ? cause.message : 'Validation failed.'); }
+    finally { setBusy(false); }
+  }
   async function publish() {
     if (!batch || !readiness?.ready || !window.confirm(`Publish ${readiness.imageCount} images and update ${readiness.variantCount} variants?`)) return;
     setBusy(true); setError('');
-    const timer = window.setInterval(() => void refreshHistory().catch(() => undefined), 750);
-    try { await authorized('/api/publishing/publish', { method: 'POST', body: JSON.stringify({ batchId: batch.id, confirm: 'PUBLISH' }) }); await refreshHistory(); }
+    const timer = window.setInterval(() => void refreshHistorySafely(), 750);
+    try { await authorized('/api/publishing/publish', { method: 'POST', body: JSON.stringify({ batchId: batch.id, confirm: 'PUBLISH' }) }); await refreshHistorySafely(); }
     catch (cause) { setError(cause instanceof Error ? cause.message : 'Publication failed.'); }
     finally { window.clearInterval(timer); setBusy(false); }
   }
   async function rollback(operation: PublicationOperation) {
     if (!window.confirm('Restore original variant associations and remove only media created by this operation?')) return;
-    setBusy(true); setError(''); try { await authorized(`/api/publishing/${operation.id}/rollback`, { method: 'POST', body: JSON.stringify({ confirm: 'ROLLBACK' }) }); await refreshHistory(); }
+    setBusy(true); setError(''); try { await authorized(`/api/publishing/${operation.id}/rollback`, { method: 'POST', body: JSON.stringify({ confirm: 'ROLLBACK' }) }); await refreshHistorySafely(); }
     catch (cause) { setError(cause instanceof Error ? cause.message : 'Rollback failed.'); } finally { setBusy(false); }
+  }
+  async function verifyAbandonment(operation: PublicationOperation) {
+    setBusy(true); setError(''); setAbandonReview(undefined);
+    try {
+      const readiness = await authorized(`/api/publishing/${operation.id}/abandon/validate`, { method: 'POST', body: '{}' });
+      setAbandonReview({ operation, readiness });
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Abandonment verification failed.'); }
+    finally { setBusy(false); }
+  }
+  async function abandonSelected() {
+    if (!abandonReview?.readiness.eligible) return;
+    const { operation } = abandonReview; const expected = `ABANDON ${operation.id}`;
+    const confirmation = window.prompt(`Type exactly: ${expected}`); if (confirmation !== expected) return;
+    const reason = window.prompt('Reason for abandoning this disposable test operation:'); if (!reason || reason.trim().length < 10) { setError('Provide an abandonment reason of at least 10 characters.'); return; }
+    setBusy(true); setError('');
+    try {
+      await authorized(`/api/publishing/${operation.id}/abandon`, { method: 'POST', body: JSON.stringify({ confirm: expected, reason }) });
+      setAbandonReview(undefined); await refreshHistorySafely();
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Abandonment failed.'); }
+    finally { setBusy(false); }
   }
   return <section className={`panel ${status.enabled ? '' : 'disabled'}`}><div className="section-number">05</div><div className="section-heading"><div><h2>Publishing and Rollback</h2><p>Explicitly validate, approve, publish, and restore a completed batch.</p></div><span className={status.enabled ? 'local' : 'future'}>{status.enabled ? 'Server enabled' : 'Disabled by default'}</span></div>
     {!status.enabled && <div className="notice">{status.reason ?? 'Publishing is disabled.'}</div>}
     <div className="publish-auth"><input type="password" autoComplete="off" placeholder="Local publishing authorization" value={authorization} onChange={(event) => setAuthorization(event.target.value)} disabled={!status.enabled}/><button disabled={!status.enabled || !authorization || !batch || busy} onClick={() => void validate()}>Validate readiness</button></div>
     {error && <div className="error">{error}</div>}
+    {historyError && <div className="notice" role="status">Publication history could not be refreshed: {historyError}</div>}
+    {abandonReview && <div className={abandonReview.readiness.eligible ? 'notice' : 'error'}><strong>Abandonment verification: {abandonReview.operation.id}</strong>{abandonReview.readiness.eligible ? <><p>Live product media order and all original variant associations match the immutable snapshot. No generated media from this operation remains attached.</p><button disabled={busy} onClick={() => void abandonSelected()}>Abandon Partial Operation</button></> : <p>{abandonReview.readiness.errors.join(' ')}</p>}</div>}
     {readiness && <div className={readiness.ready ? 'success' : 'error'}>{readiness.ready ? `${readiness.imageCount} images and ${readiness.variantCount} variants are ready.` : readiness.errors.join(' ')}</div>}
     {readiness?.ready && batch && <><div className="publish-review">{readiness.colors.map((entry) => { const item = batch.items.find((candidate) => candidate.color === entry.color); const before = product?.images.find((image) => image.id === item?.sourceImageId); return <article key={entry.color}><h3>{entry.color}</h3><div><figure><figcaption>Before</figcaption>{before ? <img src={before.url} alt="Original Shopify source"/> : <span>Unavailable</span>}</figure><figure><figcaption>After</figcaption>{item?.preview ? <img src={assetUrl(item.preview)} alt="Generated preview"/> : <span>Unavailable</span>}</figure></div><p>{entry.variantCount} variants affected</p></article>; })}</div><button className="primary" disabled={busy} onClick={() => void publish()}>{busy ? 'Operation in progress…' : 'Publish All'}</button></>}
-    {history.length > 0 && <div className="publication-history"><h3>Publication history</h3>{history.map((operation) => <article key={operation.id}><div><strong>{operation.productTitle}</strong><span>{operation.status}</span><small>{new Date(operation.updatedAt).toLocaleString()}</small></div><div>{operation.items.map((item) => <span key={item.color}>{item.color}: {item.status}</span>)}</div>{['published','partial','rollback_partial','conflict'].includes(operation.status) && <button disabled={busy} onClick={() => void rollback(operation)}>Restore Original Images</button>}</article>)}</div>}
+    {history.length > 0 && <div className="publication-history"><h3>Publication history</h3>{history.map((operation) => <article key={operation.id}><div><strong>{operation.productTitle}</strong><span>{operation.status}</span><small>{new Date(operation.updatedAt).toLocaleString()}</small></div><div>{operation.items.map((item) => <span key={item.color}>{item.color}: {item.status}</span>)}</div>{['published','partial','rollback_partial','conflict'].includes(operation.status) && <button disabled={busy} onClick={() => void rollback(operation)}>Restore Original Images</button>}{operation.productId === abandonmentTestProductId && ['partial','rollback_partial','conflict'].includes(operation.status) && <button disabled={busy} onClick={() => void verifyAbandonment(operation)}>Verify for Abandonment</button>}{operation.status === 'abandoned' && <small>Abandoned {operation.abandonedAt ? new Date(operation.abandonedAt).toLocaleString() : ''}: {operation.abandonmentReason}</small>}</article>)}</div>}
   </section>;
 }
 

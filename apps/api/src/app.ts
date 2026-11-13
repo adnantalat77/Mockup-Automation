@@ -12,6 +12,11 @@ import { ShopifyError, ShopifyService } from './services/shopify.js';
 import { BatchError, BatchService } from './services/batches.js';
 import { PublicationError, PublishingService } from './services/publishing.js';
 
+export function isPublishingOriginAllowed(origin: string | undefined, configuredOrigin: string, requireOrigin: boolean) {
+  if (!origin) return !requireOrigin;
+  return new Set([configuredOrigin, 'http://127.0.0.1:3000', 'http://localhost:3000']).has(origin);
+}
+
 export async function createApp(overrides: Partial<AppConfig> = {}) {
   const config = loadConfig(overrides);
   const store = new AssetStore(config.dataDir);
@@ -127,12 +132,11 @@ export async function createApp(overrides: Partial<AppConfig> = {}) {
     catch (error) { return response.json({ enabled: false, reason: error instanceof Error ? error.message : 'Publishing scope verification failed.' }); }
   });
 
-  const authorizePublishing = (request: express.Request) => {
+  const authorizePublishing = (request: express.Request, requireOrigin = true) => {
     if (!config.publishingEnabled) throw new PublicationError('Shopify publishing is disabled by the server.', 403);
     if (!publishing || !config.publishingAuthToken || config.publishingAuthToken.length < 32) throw new PublicationError('Shopify publishing is not configured securely.', 403);
     const origin = request.get('origin');
-    const allowedOrigins = new Set([config.webOrigin, 'http://127.0.0.1:3000', 'http://localhost:3000']);
-    if (!origin || !allowedOrigins.has(origin)) throw new PublicationError('Publishing request origin was rejected.', 403);
+    if (!isPublishingOriginAllowed(origin, config.webOrigin, requireOrigin)) throw new PublicationError('Publishing request origin was rejected.', 403);
     const supplied = request.get('x-publish-authorization') ?? '';
     const expected = Buffer.from(config.publishingAuthToken); const actual = Buffer.from(supplied);
     if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) throw new PublicationError('Publishing authorization failed.', 401);
@@ -153,8 +157,21 @@ export async function createApp(overrides: Partial<AppConfig> = {}) {
   });
 
   app.get('/api/publishing/operations', async (request, response, next) => {
-    try { authorizePublishing(request); await verifyPublishingScopes(); response.json(publishing!.list()); }
+    try { authorizePublishing(request, false); await verifyPublishingScopes(); response.json(publishing!.list()); }
     catch (error) { next(error); }
+  });
+
+  app.post('/api/publishing/:id/abandon/validate', async (request, response, next) => {
+    try { authorizePublishing(request); await verifyPublishingScopes(); response.json(await publishing!.validateAbandonment(request.params.id)); }
+    catch (error) { next(error); }
+  });
+
+  app.post('/api/publishing/:id/abandon', async (request, response, next) => {
+    try {
+      authorizePublishing(request); await verifyPublishingScopes();
+      if (request.body?.confirm !== `ABANDON ${request.params.id}`) throw new PublicationError('Explicit abandonment confirmation with the operation ID is required.', 400);
+      response.json(await publishing!.abandon(request.params.id, String(request.body?.reason ?? '')));
+    } catch (error) { next(error); }
   });
 
   app.post('/api/publishing/:id/rollback', async (request, response, next) => {

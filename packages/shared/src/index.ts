@@ -84,7 +84,27 @@ export interface MockupBatch {
   counts: { total: number; queued: number; processing: number; success: number; failed: number; skipped: number; cancelled: number };
 }
 
-export type PublicationStatus = 'validated' | 'publishing' | 'published' | 'partial' | 'rolling_back' | 'rolled_back' | 'rollback_partial' | 'conflict';
+export type PublicationStatus = 'validated' | 'publishing' | 'published' | 'partial' | 'rolling_back' | 'rolled_back' | 'rollback_partial' | 'conflict' | 'abandoned';
+
+export interface AbandonmentEvidence {
+  verifiedAt: string;
+  productId: string;
+  productTitle: string;
+  productStatus: string;
+  mediaIds: string[];
+  variantAssociations: Array<{ variantId: string; mediaIds: string[] }>;
+  generatedMediaIdsChecked: string[];
+  snapshotComplete: true;
+}
+
+export interface AbandonReadiness {
+  eligible: boolean;
+  operationId: string;
+  productId: string;
+  errors: string[];
+  evidence?: AbandonmentEvidence;
+  alreadyAbandoned?: boolean;
+}
 
 export interface PublicationItem {
   color: string;
@@ -116,6 +136,9 @@ export interface PublicationOperation {
   errors: string[];
   productRestored?: boolean;
   cleanupConflicts?: string[];
+  abandonedAt?: string;
+  abandonmentReason?: string;
+  abandonmentEvidence?: AbandonmentEvidence;
 }
 
 export interface PublishReadiness {

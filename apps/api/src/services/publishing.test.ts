@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import sharp from 'sharp';
@@ -10,7 +10,7 @@ import { PublicationError, PublishingService } from './publishing.js';
 
 const image = { id: 'gid://shopify/ProductImage/10', url: 'https://cdn.shopify.com/black.png', associatedColors: ['Black'], association: 'reliable' as const, validation: 'transparent' as const };
 const product: ShopifyProductDetail = {
-  id: 'gid://shopify/Product/123', title: 'Test Shirt', handle: 'test-shirt', status: 'ACTIVE', colors: ['Black'], sizes: ['M', 'L'], images: [image],
+  id: 'gid://shopify/Product/15608846975264', title: 'Mockup Automation - TEST ONLY', handle: 'test-shirt', status: 'DRAFT', colors: ['Black'], sizes: ['M', 'L'], images: [image],
   variants: [1, 2].map((id) => ({ id: `gid://shopify/ProductVariant/${id}`, title: `Black / ${id === 1 ? 'M' : 'L'}`, color: 'Black', size: id === 1 ? 'M' : 'L', selectedOptions: [{ name: 'Color', value: 'Black' }], associatedImageIds: [image.id] }))
 };
 
@@ -46,7 +46,17 @@ async function fixture(overrides: Record<string, unknown> = {}) {
   api.detachVariantMedia.mockImplementation(async (_productId: string, mediaId: string, variantIds: string[]) => { for (const variant of live.variants) if (variantIds.includes(variant.id)) variant.mediaIds = variant.mediaIds.filter((id) => id !== mediaId); });
   api.removeFileFromProduct.mockImplementation(async (mediaId: string) => { live.mediaIds = live.mediaIds.filter((id) => id !== mediaId); });
   const publishing = new PublishingService(root, assets, batches, api as any); await publishing.init();
-  return { root, assets, batches, batch, api, publishing, live };
+  return { root, assets, batches, batch, background, api, publishing, live };
+}
+
+async function restoredPartialFixture() {
+  const result = await fixture();
+  result.api.replaceVariantMedia.mockRejectedValueOnce(new Error('association failed'));
+  const operation = await result.publishing.publish(result.batch.id);
+  result.live.mediaIds = ['gid://shopify/MediaImage/50'];
+  for (const variant of result.live.variants) variant.mediaIds = ['gid://shopify/MediaImage/50'];
+  vi.clearAllMocks();
+  return { ...result, operation };
 }
 
 describe('PublishingService', () => {
@@ -243,5 +253,85 @@ describe('PublishingService', () => {
     await writeFile(path.join(directory, `${String(count + 1).padStart(6, '0')}.json.tmp`), '{');
     const recovered = new PublishingService(root, assets, batches, api as any); await recovered.init();
     expect(recovered.get(operation.id).status).toBe('published');
+  });
+
+  it('verifies and durably abandons a manually restored partial test operation', async () => {
+    const { root, operation, publishing, api } = await restoredPartialFixture();
+    const readiness = await publishing.validateAbandonment(operation.id);
+    expect(readiness).toMatchObject({ eligible: true, evidence: { snapshotComplete: true, generatedMediaIdsChecked: ['gid://shopify/MediaImage/99'] } });
+    const before = (await readdir(path.join(root, 'publications', operation.id))).filter((name) => name.endsWith('.json')).length;
+    const abandoned = await publishing.abandon(operation.id, 'Manual restoration verified for disposable test reset');
+    const after = (await readdir(path.join(root, 'publications', operation.id))).filter((name) => name.endsWith('.json')).length;
+    expect(abandoned).toMatchObject({ status: 'abandoned', abandonmentReason: 'Manual restoration verified for disposable test reset' });
+    expect(abandoned.abandonedAt).toBeTruthy(); expect(abandoned.abandonmentEvidence?.mediaIds).toEqual(['gid://shopify/MediaImage/50']);
+    expect(after).toBe(before + 1); expect(api.removeFileFromProduct).not.toHaveBeenCalled(); expect(api.deleteFile).not.toHaveBeenCalled();
+  });
+
+  it('rejects abandonment when generated media still references the product', async () => {
+    const { operation, publishing, live } = await restoredPartialFixture();
+    live.mediaIds.push('gid://shopify/MediaImage/99');
+    const readiness = await publishing.validateAbandonment(operation.id);
+    expect(readiness.eligible).toBe(false); expect(readiness.errors.join(' ')).toMatch(/Generated media remains/);
+  });
+
+  it('rejects abandonment for unexpected product media or changed variant associations', async () => {
+    const first = await restoredPartialFixture(); first.live.mediaIds.push('gid://shopify/MediaImage/777');
+    expect((await first.publishing.validateAbandonment(first.operation.id)).errors.join(' ')).toMatch(/ordering/);
+    const second = await restoredPartialFixture(); second.live.variants[0].mediaIds = [];
+    expect((await second.publishing.validateAbandonment(second.operation.id)).errors.join(' ')).toMatch(/media association changed/);
+  });
+
+  it('rejects abandonment when variants are missing or added', async () => {
+    const missing = await restoredPartialFixture(); missing.live.variants.pop();
+    expect((await missing.publishing.validateAbandonment(missing.operation.id)).errors.join(' ')).toMatch(/variant set|missing/);
+    const added = await restoredPartialFixture(); added.live.variants.push({ id: 'gid://shopify/ProductVariant/777', color: 'Black', mediaIds: ['gid://shopify/MediaImage/50'] });
+    expect((await added.publishing.validateAbandonment(added.operation.id)).errors.join(' ')).toMatch(/variant set|missing/);
+  });
+
+  it('rejects abandonment when Shopify cannot provide a complete snapshot', async () => {
+    const { operation, publishing, api, live } = await restoredPartialFixture();
+    api.getPublicationState.mockResolvedValueOnce({ ...structuredClone(live), complete: false });
+    expect((await publishing.validateAbandonment(operation.id)).errors.join(' ')).toMatch(/incomplete/);
+  });
+
+  it('makes duplicate abandonment idempotent without another checkpoint or Shopify read', async () => {
+    const { root, operation, publishing, api } = await restoredPartialFixture();
+    const first = await publishing.abandon(operation.id, 'Manual restoration verified for disposable test reset');
+    const directory = path.join(root, 'publications', operation.id); const count = (await readdir(directory)).filter((name) => name.endsWith('.json')).length;
+    vi.clearAllMocks(); const second = await publishing.abandon(operation.id, 'Duplicate request is safely ignored');
+    expect(second).toEqual(first); expect((await readdir(directory)).filter((name) => name.endsWith('.json'))).toHaveLength(count);
+    expect(api.getPublicationState).not.toHaveBeenCalled();
+  });
+
+  it('ignores an interrupted abandonment checkpoint and can safely retry', async () => {
+    const { root, assets, batches, operation, api } = await restoredPartialFixture(); const directory = path.join(root, 'publications', operation.id);
+    const count = (await readdir(directory)).filter((name) => name.endsWith('.json')).length;
+    await writeFile(path.join(directory, `${String(count).padStart(6, '0')}.json.partial.tmp`), '{"status":"abandoned"');
+    await writeFile(path.join(directory, `${String(count).padStart(6, '0')}.json`), '{"status":');
+    const recovered = new PublishingService(root, assets, batches, api as any); await recovered.init();
+    expect(recovered.get(operation.id).status).toBe('partial');
+    await expect(recovered.abandon(operation.id, 'Retried after interrupted checkpoint write')).resolves.toMatchObject({ status: 'abandoned' });
+  });
+
+  it('blocks a fresh batch until every nonterminal operation on the test product is abandoned', async () => {
+    const { root, assets, batches, batch, background, operation, api } = await restoredPartialFixture();
+    const second = structuredClone(operation); second.id = '22222222-2222-4222-8222-222222222222'; second.batchId = '33333333-3333-4333-8333-333333333333';
+    const secondDirectory = path.join(root, 'publications', second.id); await mkdir(secondDirectory, { recursive: true });
+    await writeFile(path.join(secondDirectory, '000000.json'), JSON.stringify(second));
+    const recovered = new PublishingService(root, assets, batches, api as any); await recovered.init();
+    const freshBatch = await waitBatch(batches, (await batches.create(product.id, background.id)).id);
+    await recovered.abandon(operation.id, 'First disposable test attempt manually restored');
+    expect((await recovered.validate(freshBatch.id)).errors.join(' ')).toContain(second.id);
+    await recovered.abandon(second.id, 'Second disposable test attempt manually restored');
+    await expect(recovered.validate(freshBatch.id)).resolves.toMatchObject({ ready: true });
+    expect(batch.id).not.toBe(freshBatch.id);
+  });
+
+  it('never offers abandonment for a production product operation', async () => {
+    const { publishing, operation, api } = await restoredPartialFixture();
+    const stored = publishing.get(operation.id); stored.productId = 'gid://shopify/Product/999';
+    const readiness = await publishing.validateAbandonment(operation.id);
+    expect(readiness).toMatchObject({ eligible: false }); expect(readiness.errors.join(' ')).toMatch(/designated disposable/);
+    expect(api.getPublicationState).not.toHaveBeenCalled();
   });
 });

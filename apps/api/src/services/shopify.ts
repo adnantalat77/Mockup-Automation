@@ -269,6 +269,9 @@ export class ShopifyService {
       }
       variants.push({ id: variant.id, color: color(variant.selectedOptions), mediaIds: variantMediaIds });
     }
+    if (new Set(mediaIds).size !== mediaIds.length || new Set(variants.map((variant) => variant.id)).size !== variants.length || variants.some((variant) => new Set(variant.mediaIds).size !== variant.mediaIds.length)) {
+      throw new ShopifyError('Shopify publication snapshot contains duplicate media or variant identities.', 502, 'INCOMPLETE_SNAPSHOT');
+    }
     return {
       complete: true,
       mediaIds,

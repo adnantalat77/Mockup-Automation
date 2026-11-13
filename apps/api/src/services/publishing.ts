@@ -13,18 +13,78 @@ const STEP = (kind: string, color: string) => `${kind}:${color}`;
 export const ABANDONMENT_TEST_PRODUCT_ID = 'gid://shopify/Product/15608846975264';
 const ABANDONMENT_TEST_PRODUCT_TITLE = 'Mockup Automation - TEST ONLY';
 const NONBLOCKING_STATUSES = new Set(['published', 'rolled_back', 'rolled_back_files_retained', 'abandoned']);
+const OPERATION_STATUSES = new Set(['validated', 'publishing', 'published', 'partial', 'rolling_back', 'rolled_back', 'rolled_back_files_retained', 'rollback_partial', 'conflict', 'abandoned']);
+const ITEM_STATUSES = new Set(['pending', 'uploaded', 'associated', 'failed', 'rolled_back']);
+const ITEM_INTENTS = new Set(['stage_upload', 'create_file', 'add_product_reference', 'append_variants', 'replace_variants', 'remove_original_reference', 'restore_original_reference', 'restore_variants', 'reorder_published', 'detach_variants', 'remove_product_reference', 'delete_file', 'restore_order']);
 type PublishingShopify = Pick<ShopifyService, 'getProduct' | 'getPublicationState' | 'downloadImage' | 'stageImage' | 'createImageFile' | 'waitForFileReady' | 'addFileToProduct' | 'removeFileFromProduct' | 'replaceVariantMedia' | 'detachVariantMedia' | 'reorderMedia'>;
 
 export class PublicationError extends Error { constructor(message: string, readonly status = 400) { super(message); } }
 const same = (left: string[], right: string[]) => left.length === right.length && left.every((value, index) => value === right[index]);
-function validOperation(value: unknown): value is PublicationOperation {
+function structurallyValidOperation(value: unknown): value is PublicationOperation {
   if (!value || typeof value !== 'object') return false;
   const item = value as Partial<PublicationOperation>;
   return item.version === 1 && typeof item.id === 'string' && STRICT_UUID.test(item.id) && typeof item.batchId === 'string' &&
-    typeof item.productId === 'string' && typeof item.status === 'string' && Array.isArray(item.originalMediaOrder) &&
-    Array.isArray(item.originalVariantMedia) && Array.isArray(item.expectedPublishedMediaOrder) && Array.isArray(item.items) &&
-    item.items.every((entry) => entry && typeof entry.color === 'string' && typeof entry.previewId === 'string' && Array.isArray(entry.variantIds)) &&
-    Array.isArray(item.completedSteps) && Array.isArray(item.errors);
+    typeof item.productId === 'string' && typeof item.productTitle === 'string' && typeof item.status === 'string' && Array.isArray(item.originalMediaOrder) && item.originalMediaOrder.every((id) => typeof id === 'string') &&
+    Array.isArray(item.originalVariantMedia) && item.originalVariantMedia.every((entry) => entry && typeof entry.variantId === 'string' && Array.isArray(entry.mediaIds) && entry.mediaIds.every((id) => typeof id === 'string')) &&
+    Array.isArray(item.expectedPublishedMediaOrder) && item.expectedPublishedMediaOrder.every((id) => typeof id === 'string') && Array.isArray(item.items) &&
+    item.items.every((entry) => entry && typeof entry.color === 'string' && typeof entry.previewId === 'string' && Array.isArray(entry.variantIds) && entry.variantIds.every((id) => typeof id === 'string')) &&
+    Array.isArray(item.completedSteps) && item.completedSteps.every((step) => typeof step === 'string') && Array.isArray(item.errors) && item.errors.every((error) => typeof error === 'string');
+}
+
+function duplicates(values: string[]) { return values.length !== new Set(values).size; }
+function operationIntegrityErrors(operation: PublicationOperation) {
+  const errors: string[] = [];
+  if (!OPERATION_STATUSES.has(operation.status)) errors.push('invalid operation status');
+  if (!PRODUCT_GID.test(operation.productId) || typeof operation.productTitle !== 'string' || !operation.productTitle) errors.push('invalid product identity');
+  if (duplicates(operation.originalMediaOrder)) errors.push('duplicate original media IDs');
+  if (duplicates(operation.expectedPublishedMediaOrder)) errors.push('duplicate expected media IDs');
+  if (duplicates(operation.completedSteps)) errors.push('duplicate completed steps');
+  const originalVariantIds = operation.originalVariantMedia.map((entry) => entry.variantId);
+  if (duplicates(originalVariantIds) || operation.originalVariantMedia.some((entry) => duplicates(entry.mediaIds))) errors.push('duplicate immutable variant evidence');
+  const colors = operation.items.map((entry) => entry.color);
+  const mappedVariants = operation.items.flatMap((entry) => entry.variantIds);
+  const createdMedia = operation.items.map((entry) => entry.createdMediaId).filter((id): id is string => Boolean(id));
+  if (duplicates(colors) || duplicates(mappedVariants) || duplicates(createdMedia)) errors.push('duplicate item ownership evidence');
+  if (operation.items.some((entry) => !entry.color || !STRICT_UUID.test(entry.previewId) || !ITEM_STATUSES.has(entry.status) || duplicates(entry.variantIds) || entry.variantIds.some((id) => !originalVariantIds.includes(id)))) errors.push('invalid publication item evidence');
+  if (operation.items.some((entry) => entry.intent && !ITEM_INTENTS.has(entry.intent))) errors.push('invalid pending mutation intent');
+  if (operation.items.some((entry) => entry.intent && entry.intent !== 'stage_upload' && entry.intent !== 'create_file' && !entry.createdMediaId)) errors.push('mutation intent lacks created-media ownership');
+  if (operation.rollbackMode && operation.rollbackMode !== 'no_global_delete') errors.push('invalid rollback mode');
+  if (operation.sourceValidationSchemaVersion === 1 && operation.items.some((entry) => !entry.sourceProvenance || !entry.generationEvidence)) errors.push('incomplete source-integrity evidence');
+  if (mappedVariants.length !== originalVariantIds.length || originalVariantIds.some((id) => !mappedVariants.includes(id))) errors.push('incomplete item-to-variant ownership');
+  const originalMedia = new Set(operation.originalMediaOrder);
+  if (operation.originalVariantMedia.some((entry) => entry.mediaIds.some((id) => !originalMedia.has(id)))) errors.push('variant association outside original gallery');
+  return errors;
+}
+
+function snapshotStructureError(state: ShopifyPublicationState) {
+  if (state.complete !== true) return 'Shopify returned an incomplete publication snapshot.';
+  if (duplicates(state.mediaIds)) return 'Shopify product media snapshot contains duplicate IDs.';
+  if (duplicates(state.variants.map((variant) => variant.id))) return 'Shopify variant snapshot contains duplicate IDs.';
+  if (state.variants.some((variant) => duplicates(variant.mediaIds))) return 'Shopify variant-media snapshot contains duplicate associations.';
+  return undefined;
+}
+
+function exactVariantError(expected: Array<{ variantId: string; mediaIds: string[] }>, live: ShopifyPublicationState['variants']) {
+  if (expected.length !== live.length) return 'the product variant set changed externally.';
+  const expectedById = new Map(expected.map((entry) => [entry.variantId, entry.mediaIds]));
+  for (const variant of live) {
+    const association = expectedById.get(variant.id);
+    if (!association) return `unexpected variant ${variant.id}.`;
+    if (!same(variant.mediaIds, association)) return `variant ${variant.id} media changed externally.`;
+  }
+  for (const entry of expected) if (!live.some((variant) => variant.id === entry.variantId)) return `expected variant ${entry.variantId} is missing.`;
+  return undefined;
+}
+
+function terminalPublicationError(operation: PublicationOperation) {
+  if (operation.items.some((item) => item.intent)) return 'a mutation intent remains unresolved.';
+  if (operation.items.some((item) => !item.createdMediaId || item.status !== 'associated' || !operation.completedSteps.includes(STEP('created', item.color)) || !operation.completedSteps.includes(STEP('product', item.color)) || !operation.completedSteps.includes(STEP('variants', item.color)))) return 'required publication steps are incomplete.';
+  const created = operation.items.map((item) => item.createdMediaId!);
+  const expected = operation.publicationMode === 'replace_gallery' ? created : [...operation.originalMediaOrder, ...created];
+  if (!same(expected, operation.expectedPublishedMediaOrder)) return 'generated media ownership does not match the expected published order.';
+  if (!operation.completedSteps.includes('published-order')) return 'published media ordering was not durably checkpointed.';
+  if (operation.publicationMode === 'replace_gallery' && operation.originalMediaOrder.some((id) => !operation.completedSteps.includes(`removed-original:${id}`))) return 'original media removal is not durably complete.';
+  return undefined;
 }
 
 export class PublishingService {
@@ -42,8 +102,7 @@ export class PublishingService {
     await mkdir(this.folder, { recursive: true });
     for (const operationId of await readdir(this.folder)) {
       if (!STRICT_UUID.test(operationId)) continue;
-      const operation = await this.readLatest(operationId).catch(() => undefined);
-      if (!operation) continue;
+      const operation = await this.readLatest(operationId);
       const uncertainItems = operation.items.filter((item) => item.intent === 'create_file' && !item.createdMediaId);
       const uncertainDeletionItems = operation.items.filter((item) => item.intent === 'delete_file' && item.createdMediaId && item.cleanupOutcome?.kind !== 'cleanup_outcome_uncertain' && !operation.completedSteps.includes(STEP('deleted', item.color)));
       if (uncertainItems.length) {
@@ -211,7 +270,8 @@ export class PublishingService {
           }
         }
         const [publishedProduct, publishedState] = await Promise.all([this.shopify.getProduct(operation!.productId, false), this.shopify.getPublicationState(operation!.productId)]);
-        const conflict = publishedProduct.id !== operation!.productId || publishedProduct.title !== operation!.productTitle ? 'product identity changed during publication.' : this.compareExpected(operation!, publishedState, 'published');
+        const durableConflict = terminalPublicationError(operation!);
+        const conflict = durableConflict ?? (publishedProduct.id !== operation!.productId || publishedProduct.title !== operation!.productTitle ? 'product identity changed during publication.' : this.compareExpected(operation!, publishedState, 'published'));
         if (conflict) return this.markConflict(operation!, `Published state verification failed: ${conflict}`);
         operation!.status = 'published';
       } else operation!.status = 'partial';
@@ -293,8 +353,8 @@ export class PublishingService {
       if (operation.items.every((item) => !item.createdMediaId || item.status === 'rolled_back')) {
         const marker = operation.items[0]; if (marker) await this.intent(operation, marker, 'restore_order'); await this.shopify.reorderMedia(operation.productId, operation.originalMediaOrder); if (marker) marker.intent = undefined;
         operation.completedSteps.push('original-order-restored'); await this.checkpoint(operation);
-        const live = await this.shopify.getPublicationState(operation.productId); const expectedVariants = new Map(operation.originalVariantMedia.map((v) => [v.variantId, v.mediaIds]));
-        const restored = same(live.mediaIds, operation.originalMediaOrder) && live.variants.every((v) => same(v.mediaIds, expectedVariants.get(v.id) ?? []));
+        const live = await this.shopify.getPublicationState(operation.productId);
+        const restored = !snapshotStructureError(live) && same(live.mediaIds, operation.originalMediaOrder) && !exactVariantError(operation.originalVariantMedia, live.variants);
         operation.productRestored = restored;
         if (!restored) { operation.status = 'conflict'; operation.conflictKinds.push('restoration_mismatch'); operation.errors.push('Product restoration did not match the immutable original snapshot.'); }
         else if (operation.cleanupConflicts.length) operation.status = 'conflict';
@@ -350,6 +410,7 @@ export class PublishingService {
 
   private async rollbackFinalizationReadiness(operation: PublicationOperation): Promise<RollbackFinalizationReadiness> {
     const errors: string[] = [];
+    errors.push(...operationIntegrityErrors(operation).map((error) => `Checkpoint integrity: ${error}.`));
     const generated = operation.items.map((item) => item.createdMediaId).filter((id): id is string => Boolean(id));
     if (operation.status !== 'conflict') errors.push('Only a conflicted operation can be finalized.');
     const disposableTestProduct = operation.productId === ABANDONMENT_TEST_PRODUCT_ID && operation.productTitle === ABANDONMENT_TEST_PRODUCT_TITLE;
@@ -386,7 +447,7 @@ export class PublishingService {
     if (errors.length) return { eligible: false, operationId: operation.id, productId: operation.productId, retainedFileCount: generated.length, errors };
 
     const [product, state] = await Promise.all([this.shopify.getProduct(operation.productId, false), this.shopify.getPublicationState(operation.productId)]);
-    if (!state.complete) errors.push('Shopify returned an incomplete publication snapshot.');
+    const structureError = snapshotStructureError(state); if (structureError) errors.push(structureError);
     if (product.id !== operation.productId || product.title !== operation.productTitle) errors.push('The live Shopify product identity does not match the immutable operation.');
     if (disposableTestProduct && product.status.toUpperCase() !== 'DRAFT') errors.push('The designated disposable test product is no longer Draft.');
     if (!same(state.mediaIds, operation.originalMediaOrder)) errors.push('Live product media IDs or ordering do not match the immutable original snapshot.');
@@ -415,7 +476,7 @@ export class PublishingService {
     if (!['partial', 'conflict', 'rollback_partial'].includes(operation.status)) errors.push('Only a partial or conflicted test publication can be abandoned.');
     if (errors.length) return { eligible: false, operationId: operation.id, productId: operation.productId, errors };
     const [product, state] = await Promise.all([this.shopify.getProduct(operation.productId, false), this.shopify.getPublicationState(operation.productId)]);
-    if (!state.complete) errors.push('Shopify returned an incomplete publication snapshot.');
+    const structureError = snapshotStructureError(state); if (structureError) errors.push(structureError);
     if (product.id !== ABANDONMENT_TEST_PRODUCT_ID || product.title !== ABANDONMENT_TEST_PRODUCT_TITLE || product.status.toUpperCase() !== 'DRAFT') errors.push('The operation does not target the designated disposable draft product.');
     if (!same(state.mediaIds, operation.originalMediaOrder)) errors.push('Current product media IDs or ordering do not exactly match the immutable original snapshot.');
     const originals = new Map(operation.originalVariantMedia.map((entry) => [entry.variantId, entry.mediaIds]));
@@ -463,6 +524,7 @@ export class PublishingService {
   }
 
   private compareExpected(operation: PublicationOperation, live: ShopifyPublicationState, mode: 'publish-retry' | 'published' | 'rollback') {
+    const snapshotError = snapshotStructureError(live); if (snapshotError) return snapshotError;
     if (!live.complete) return 'Shopify returned an incomplete publication snapshot.';
     const replacesGallery = operation.publicationMode === 'replace_gallery';
     const created = operation.items.map((item) => item.createdMediaId).filter((id): id is string => Boolean(id)); const allowed = new Set([...operation.originalMediaOrder, ...created]);
@@ -479,7 +541,8 @@ export class PublishingService {
     if (mode === 'published' && !same(live.mediaIds, operation.expectedPublishedMediaOrder)) return 'published media ordering does not match the recorded order.';
     const originals = new Map(operation.originalVariantMedia.map((entry) => [entry.variantId, entry.mediaIds]));
     for (const variant of live.variants) {
-      const original = [...(originals.get(variant.id) ?? [])];
+      if (!originals.has(variant.id)) return `unexpected variant ${variant.id}.`;
+      const original = [...originals.get(variant.id)!];
       const item = operation.items.find((candidate) => candidate.variantIds.includes(variant.id) && candidate.createdMediaId);
       if (!item?.createdMediaId) { if (!same(variant.mediaIds, original)) return `variant ${variant.id} media changed externally.`; continue; }
       const generated = [item.createdMediaId];
@@ -498,7 +561,10 @@ export class PublishingService {
   private async preflight(batchId: string) {
     const errors: string[] = []; let batch: MockupBatch; try { batch = await this.batches.get(batchId); } catch { throw new PublicationError('Batch not found.', 404); }
     if (batch.status !== 'completed') errors.push('The selected batch must be fully completed with no failed or skipped colors.');
-    const [product, state] = await Promise.all([this.shopify.getProduct(batch.productId, false), this.shopify.getPublicationState(batch.productId)]); if (!state.complete) errors.push('Shopify publication snapshot is incomplete.');
+    const [product, state] = await Promise.all([this.shopify.getProduct(batch.productId, false), this.shopify.getPublicationState(batch.productId)]);
+    const structureError = snapshotStructureError(state); if (structureError) errors.push(structureError);
+    const productVariantIds = product.variants.map((variant) => variant.id); const stateVariantIds = state.variants.map((variant) => variant.id);
+    if (duplicates(productVariantIds) || productVariantIds.length !== stateVariantIds.length || productVariantIds.some((id) => !stateVariantIds.includes(id))) errors.push('The complete publication snapshot variant set does not match the live product variant set.');
     const disposableTestProduct = product.id === ABANDONMENT_TEST_PRODUCT_ID && product.title === ABANDONMENT_TEST_PRODUCT_TITLE && product.status.toUpperCase() === 'DRAFT';
     if (!disposableTestProduct && !this.allowedProductIds.has(product.id)) errors.push('This Shopify product is not approved by the server-side publishing allowlist.');
     if (product.id !== batch.productId || product.title !== batch.productTitle) errors.push('The live Shopify product identity does not match the completed batch.');
@@ -573,14 +639,21 @@ export class PublishingService {
   }
   private async readLatest(id: string) {
     const directory = path.join(this.folder, id); const files = (await readdir(directory)).filter((name) => /^\d{6}\.json$/.test(name)).sort().reverse();
-    for (const file of files) { try {
-      const parsed: unknown = JSON.parse(await readFile(path.join(directory, file), 'utf8'));
+    for (const file of files) {
+      let parsed: unknown;
+      try { parsed = JSON.parse(await readFile(path.join(directory, file), 'utf8')); }
+      catch { continue; /* fall back from an incomplete or malformed write */ }
       const legacy = parsed as Partial<PublicationOperation>;
       if (legacy?.version === 1 && !Array.isArray(legacy.expectedPublishedMediaOrder) && Array.isArray(legacy.originalMediaOrder) && Array.isArray(legacy.items)) {
         legacy.expectedPublishedMediaOrder = [...legacy.originalMediaOrder, ...legacy.items.map((item) => item.createdMediaId).filter((mediaId): mediaId is string => Boolean(mediaId))];
       }
-      if (validOperation(parsed) && parsed.id === id) return parsed;
-    } catch { /* fall back to the previous complete checkpoint */ } }
+      if (structurallyValidOperation(parsed)) {
+        const integrityErrors = operationIntegrityErrors(parsed);
+        if (integrityErrors.length) throw new PublicationError(`Publication checkpoint integrity validation failed: ${integrityErrors.join(', ')}.`, 409);
+        if (parsed.id !== id) throw new PublicationError('Publication checkpoint identity does not match its directory.', 409);
+        return parsed;
+      }
+    }
     throw new PublicationError('No complete publication checkpoint was found.', 409);
   }
   private blockingOperation(productId: string, allowedOperationId?: string) {

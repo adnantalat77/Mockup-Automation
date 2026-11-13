@@ -23,6 +23,8 @@ npm run dev
 
 The API acquires an OS-backed exclusive lock for its canonical `DATA_DIR` before initializing any persistent service. Starting a second API against the same local Windows data directory fails safely with a clear duplicate-instance diagnostic; it does not read-repair or write shared state. Graceful shutdown releases the lock after the HTTP server closes, and Windows releases it automatically after a crash. See [docs/TASK020_SINGLE_INSTANCE.md](docs/TASK020_SINGLE_INSTANCE.md).
 
+Publication and rollback recovery validate unique, complete Shopify snapshots; exact gallery ordering; exact variant GID sets and associations; internally consistent checkpoints; and all durable terminal steps. Contradictory complete checkpoints fail startup, while truncated writes fall back to the previous complete checkpoint. See [docs/TASK021_RECOVERY_INTEGRITY.md](docs/TASK021_RECOVERY_INTEGRITY.md).
+
 Open <http://127.0.0.1:3000>. The API listens on <http://127.0.0.1:3001>. During local development, Vite proxies same-origin `/api` requests to the API, avoiding browser CORS and `localhost` IPv4/IPv6 resolution differences. The environment file is optional because local defaults are built in. For separate-origin production hosting only, set `VITE_API_URL` to the deployed API origin.
 
 ```powershell

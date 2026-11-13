@@ -577,6 +577,28 @@ describe('PublishingService', () => {
     expect(api.reorderMedia).toHaveBeenCalledOnce(); expect(api.createImageFile).toHaveBeenCalledOnce(); expect(api.replaceVariantMedia).toHaveBeenCalledOnce();
   });
 
+  it.each([
+    ['duplicate product media', (state: any) => { state.mediaIds.push(state.mediaIds[0]); }, /duplicate IDs/],
+    ['duplicate variant identity', (state: any) => { state.variants.push(structuredClone(state.variants[0])); }, /duplicate IDs/],
+    ['duplicate variant association', (state: any) => { state.variants[0].mediaIds.push(state.variants[0].mediaIds[0]); }, /duplicate associations/]
+  ])('rejects partial recovery with %s in the complete Shopify snapshot', async (_name, mutate, message) => {
+    const { batch, publishing, api, live } = await fixture();
+    api.waitForFileReady.mockRejectedValueOnce(new Error('processing interrupted'));
+    const operation = await publishing.publish(batch.id);
+    mutate(live);
+    const readiness = await publishing.validateRecovery(operation.id, batch.id);
+    expect(readiness.eligible).toBe(false); expect(readiness.errors.join(' ')).toMatch(message);
+    await expect(publishing.resume(operation.id, batch.id)).rejects.toBeInstanceOf(PublicationError);
+  });
+
+  it('does not declare publication successful when final readback contains duplicate media evidence', async () => {
+    const { batch, publishing, api, live } = await fixture();
+    api.reorderMedia.mockImplementation(async (_id: string, ids: string[]) => { live.mediaIds = [...ids, ids[0]]; });
+    const operation = await publishing.publish(batch.id);
+    expect(operation.status).toBe('conflict');
+    expect(operation.errors.join(' ')).toMatch(/duplicate IDs/);
+  });
+
   it('rejects external variant-media changes before rollback', async () => {
     const { batch, publishing, api, live } = await fixture();
     const published = await publishing.publish(batch.id);
@@ -682,7 +704,10 @@ describe('PublishingService', () => {
     ['missing variant', (state: any) => { state.variants.pop(); }, /variant set|missing/],
     ['unexpected variant', (state: any) => { state.variants.push({ id: 'gid://shopify/ProductVariant/777', mediaIds: [] }); }, /variant set|unexpected/],
     ['changed variant association', (state: any) => { state.variants[0].mediaIds = []; }, /association/],
-    ['incomplete pagination', (state: any) => { state.complete = false; }, /incomplete/]
+    ['incomplete pagination', (state: any) => { state.complete = false; }, /incomplete/],
+    ['duplicate product media', (state: any) => { state.mediaIds.push(state.mediaIds[0]); }, /duplicate IDs/],
+    ['duplicate variant identity', (state: any) => { state.variants.push(structuredClone(state.variants[0])); }, /duplicate IDs/],
+    ['duplicate variant media', (state: any) => { state.variants[0].mediaIds.push(state.variants[0].mediaIds[0]); }, /duplicate associations/]
   ])('rejects rollback finalization when live state has %s', async (_name, mutate, message) => {
     const { operation, publishing, api, live } = await retainedRollbackFixture();
     const changed = structuredClone(live); mutate(changed); api.getPublicationState.mockResolvedValueOnce(changed);
@@ -718,6 +743,18 @@ describe('PublishingService', () => {
     await writeFile(path.join(directory, `${String(count + 1).padStart(6, '0')}.json.tmp`), '{');
     const recovered = new PublishingService(root, assets, batches, api as any); await recovered.init();
     expect(recovered.get(operation.id).status).toBe('published');
+  });
+
+  it('fails startup instead of falling back past a contradictory complete checkpoint', async () => {
+    const { root, assets, batches, batch, api, publishing } = await fixture();
+    const operation = await publishing.publish(batch.id); const directory = path.join(root, 'publications', operation.id);
+    const files = (await readdir(directory)).filter((name) => name.endsWith('.json')).sort();
+    const contradictory = structuredClone(operation);
+    contradictory.items.push({ ...structuredClone(contradictory.items[0]), color: contradictory.items[0].color });
+    await writeFile(path.join(directory, `${String(files.length).padStart(6, '0')}.json`), JSON.stringify(contradictory));
+    const recovered = new PublishingService(root, assets, batches, api as any);
+    await expect(recovered.init()).rejects.toThrow(/checkpoint integrity.*duplicate item ownership/i);
+    expect(api.createImageFile).toHaveBeenCalledOnce();
   });
 
   it('verifies and durably abandons a manually restored partial test operation', async () => {

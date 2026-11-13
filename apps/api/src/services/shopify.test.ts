@@ -132,6 +132,18 @@ describe('ShopifyService', () => {
     await expect(new ShopifyService(config, fetcher as unknown as typeof fetch).getPublicationState('gid://shopify/Product/123')).rejects.toMatchObject({ code: 'INCOMPLETE_SNAPSHOT' });
   });
 
+  it('fails closed when paginated publication state repeats an identity', async () => {
+    const connection = (nodes: unknown[], hasNextPage = false, endCursor: string | null = null) => ({ nodes, pageInfo: { hasNextPage, endCursor } });
+    const repeated = { id: 'gid://shopify/MediaImage/1' };
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(json({ access_token: 'token', expires_in: 3600 }))
+      .mockResolvedValueOnce(json({ data: { product: { media: connection([repeated], true, 'next') } } }))
+      .mockResolvedValueOnce(json({ data: { product: { media: connection([repeated]) } } }))
+      .mockResolvedValueOnce(json({ data: { product: { variants: connection([]) } } }));
+    await expect(new ShopifyService(config, fetcher as unknown as typeof fetch).getPublicationState('gid://shopify/Product/123'))
+      .rejects.toMatchObject({ code: 'INCOMPLETE_SNAPSHOT', message: expect.stringMatching(/duplicate/) });
+  });
+
   it('replaces existing variant media with productVariantsBulkUpdate and disables partial updates', async () => {
     const variantIds = ['gid://shopify/ProductVariant/1', 'gid://shopify/ProductVariant/2'];
     const fetcher = vi.fn().mockResolvedValueOnce(json({ access_token: 'token', expires_in: 3600 })).mockResolvedValueOnce(json({ data: {

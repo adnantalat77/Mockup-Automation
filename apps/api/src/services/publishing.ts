@@ -35,7 +35,12 @@ export class PublishingService {
       if (!STRICT_UUID.test(operationId)) continue;
       const operation = await this.readLatest(operationId).catch(() => undefined);
       if (!operation) continue;
-      if (operation.status === 'publishing') { operation.status = 'partial'; operation.errors.push('Publishing was interrupted; live reconciliation is required before retry.'); await this.checkpoint(operation); }
+      const uncertainItems = operation.items.filter((item) => item.intent === 'create_file' && !item.createdMediaId);
+      if (uncertainItems.length) {
+        for (const item of uncertainItems) { item.uncertainCreation = true; item.status = 'failed'; item.error = 'Shopify file creation may have completed before the process stopped; ownership is uncertain.'; }
+        operation.status = 'conflict'; operation.errors = uncertainItems.map((item) => `${item.color}: interrupted fileCreate requires manual reconciliation; it will not be retried.`);
+        await this.checkpoint(operation);
+      } else if (operation.status === 'publishing') { operation.status = 'partial'; operation.errors.push('Publishing was interrupted; live reconciliation is required before retry.'); await this.checkpoint(operation); }
       if (operation.status === 'rolling_back') { operation.status = 'rollback_partial'; operation.errors.push('Rollback was interrupted; live reconciliation is required before retry.'); await this.checkpoint(operation); }
       this.records.set(operation.id, operation);
     }
@@ -66,7 +71,7 @@ export class PublishingService {
       operation!.status = 'publishing'; operation!.errors = []; await this.checkpoint(operation!);
       for (const item of operation!.items) {
         if (item.status === 'associated') continue;
-        if (item.uncertainCreation) return this.markConflict(operation!, `${item.color}: file creation result is uncertain and cannot be safely retried.`);
+        if (item.uncertainCreation || (item.intent === 'create_file' && !item.createdMediaId)) return this.markConflict(operation!, `${item.color}: file creation result is uncertain and cannot be safely retried.`);
         try {
           const bytes = (await this.assets.bytes('preview', item.previewId)).buffer;
           const filename = `${operation!.productTitle}-${item.color}.png`.replace(/[^a-z0-9._-]+/gi, '-');
@@ -116,16 +121,20 @@ export class PublishingService {
     return this.withLock(operation.productId, async () => {
       const current = await this.shopify.getPublicationState(operation.productId);
       const conflict = this.compareExpected(operation, current, 'rollback'); if (conflict) return this.markConflict(operation, `Rollback blocked: ${conflict}`);
-      operation.status = 'rolling_back'; operation.errors = []; await this.checkpoint(operation);
+      operation.status = 'rolling_back'; operation.errors = []; operation.cleanupConflicts = []; operation.productRestored = false; await this.checkpoint(operation);
       for (const item of [...operation.items].reverse()) {
-        if (!item.createdMediaId || item.status === 'rolled_back') continue;
+        if (!item.createdMediaId || (item.status === 'rolled_back' && !item.cleanupPending)) continue;
         try {
           const mediaId = item.createdMediaId; const liveVariantIds = current.variants.filter((v) => v.mediaIds.includes(mediaId)).map((v) => v.id);
           if (liveVariantIds.length) { await this.intent(operation, item, 'detach_variants'); await this.shopify.detachVariantMedia(operation.productId, mediaId, liveVariantIds); item.intent = undefined; operation.completedSteps.push(STEP('detached', item.color)); await this.checkpoint(operation); }
           if (current.mediaIds.includes(mediaId)) { await this.intent(operation, item, 'remove_product_reference'); await this.shopify.removeFileFromProduct(mediaId, operation.productId); item.intent = undefined; operation.completedSteps.push(STEP('removed-reference', item.color)); await this.checkpoint(operation); }
           const deletion = await this.shopify.verifyFileDeletionSafe(mediaId, operation.productId);
-          if (!deletion.safe) return this.markConflict(operation, `${item.color}: created file was preserved because deletion ownership is uncertain: ${deletion.reason}`);
-          await this.intent(operation, item, 'delete_file'); await this.shopify.deleteFile(mediaId); item.intent = undefined; operation.completedSteps.push(STEP('deleted', item.color)); item.status = 'rolled_back'; item.error = undefined; await this.checkpoint(operation);
+          if (!deletion.safe) {
+            item.status = 'rolled_back'; item.cleanupPending = true;
+            const cleanupMessage = `${item.color}: generated file was preserved because deletion ownership is uncertain: ${deletion.reason}`;
+            operation.cleanupConflicts.push(cleanupMessage); await this.checkpoint(operation); continue;
+          }
+          await this.intent(operation, item, 'delete_file'); await this.shopify.deleteFile(mediaId); item.intent = undefined; operation.completedSteps.push(STEP('deleted', item.color)); item.status = 'rolled_back'; item.cleanupPending = false; item.error = undefined; await this.checkpoint(operation);
         } catch (error) { item.error = error instanceof Error ? error.message : 'Rollback failed.'; operation.errors.push(`${item.color}: ${item.error}`); await this.checkpoint(operation); }
       }
       if (operation.items.every((item) => !item.createdMediaId || item.status === 'rolled_back')) {
@@ -133,14 +142,17 @@ export class PublishingService {
         operation.completedSteps.push('original-order-restored'); await this.checkpoint(operation);
         const live = await this.shopify.getPublicationState(operation.productId); const expectedVariants = new Map(operation.originalVariantMedia.map((v) => [v.variantId, v.mediaIds]));
         const restored = same(live.mediaIds, operation.originalMediaOrder) && live.variants.every((v) => same(v.mediaIds, expectedVariants.get(v.id) ?? []));
-        operation.status = restored ? 'rolled_back' : 'conflict'; if (!restored) operation.errors.push('Rollback verification did not match the immutable original snapshot.');
+        operation.productRestored = restored;
+        if (!restored) { operation.status = 'conflict'; operation.errors.push('Product restoration did not match the immutable original snapshot.'); }
+        else if (operation.cleanupConflicts.length) { operation.status = 'conflict'; operation.errors.push('Product restoration succeeded, but generated-file cleanup requires manual review.'); }
+        else operation.status = 'rolled_back';
       } else operation.status = 'rollback_partial';
       await this.checkpoint(operation); return operation;
     });
   }
 
   private async reconcilePublication(operation: PublicationOperation) {
-    if (operation.items.some((item) => item.uncertainCreation)) return 'A fileCreate result is uncertain; manual ownership reconciliation is required.';
+    if (operation.items.some((item) => item.uncertainCreation || (item.intent === 'create_file' && !item.createdMediaId))) return 'A fileCreate result is uncertain; manual ownership reconciliation is required and fileCreate will not be retried.';
     const live = await this.shopify.getPublicationState(operation.productId); const conflict = this.compareExpected(operation, live, 'publish-retry'); if (conflict) return conflict;
     for (const item of operation.items) {
       if (!item.createdMediaId) continue; const onProduct = live.mediaIds.includes(item.createdMediaId);

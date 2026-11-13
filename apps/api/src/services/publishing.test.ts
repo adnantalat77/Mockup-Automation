@@ -122,6 +122,32 @@ describe('PublishingService', () => {
     expect(create).toHaveBeenCalledOnce();
   });
 
+  it('recovers a crash after fileCreate success as an uncertain-creation conflict without duplicating the file', async () => {
+    const { root, assets, batches, batch, api, publishing } = await fixture();
+    const completed = await publishing.publish(batch.id);
+    const directory = path.join(root, 'publications', completed.id);
+    const count = (await readdir(directory)).filter((name) => name.endsWith('.json')).length;
+    const interrupted = structuredClone(completed);
+    interrupted.status = 'publishing'; interrupted.expectedPublishedMediaOrder = [...interrupted.originalMediaOrder];
+    interrupted.completedSteps = []; interrupted.items[0].createdMediaId = undefined; interrupted.items[0].intent = 'create_file'; interrupted.items[0].status = 'pending';
+    await writeFile(path.join(directory, `${String(count).padStart(6, '0')}.json`), JSON.stringify(interrupted));
+
+    const recovered = new PublishingService(root, assets, batches, api as any); await recovered.init();
+    expect(recovered.get(completed.id)).toMatchObject({ status: 'conflict', items: [{ uncertainCreation: true, intent: 'create_file' }] });
+    await expect(recovered.publish(batch.id)).rejects.toBeInstanceOf(PublicationError);
+    expect(api.createImageFile).toHaveBeenCalledOnce();
+  });
+
+  it('fails closed when an existing partial operation retains create_file intent without a media ID', async () => {
+    const { batch, api, publishing } = await fixture();
+    const operation = await publishing.publish(batch.id);
+    const stored = publishing.get(operation.id);
+    stored.status = 'partial'; stored.expectedPublishedMediaOrder = [...stored.originalMediaOrder]; stored.completedSteps = [];
+    stored.items[0].createdMediaId = undefined; stored.items[0].intent = 'create_file'; stored.items[0].status = 'pending';
+    await expect(publishing.publish(batch.id)).resolves.toMatchObject({ status: 'conflict' });
+    expect(api.createImageFile).toHaveBeenCalledOnce();
+  });
+
   it('reconciles live state before retrying a partial association', async () => {
     const { batch, publishing, api, live } = await fixture();
     api.appendVariantMedia.mockRejectedValueOnce(new Error('temporary failure')).mockImplementation(async (_productId: string, mediaId: string, variantIds: string[]) => {
@@ -162,7 +188,9 @@ describe('PublishingService', () => {
     const { batch, publishing, api } = await fixture();
     const published = await publishing.publish(batch.id);
     api.verifyFileDeletionSafe.mockResolvedValueOnce({ safe: false, reason: 'shared reference may exist' });
-    await expect(publishing.rollback(published.id)).resolves.toMatchObject({ status: 'conflict' });
+    await expect(publishing.rollback(published.id)).resolves.toMatchObject({
+      status: 'conflict', productRestored: true, cleanupConflicts: [expect.stringContaining('generated file was preserved')]
+    });
     expect(api.deleteFile).not.toHaveBeenCalled();
   });
 

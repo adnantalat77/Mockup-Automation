@@ -50,4 +50,8 @@ Rollback first compares current media with the union of snapshot media and media
 
 Publication snapshots use independent cursor loops for product media, product variants, and every variant's nested media connection. Missing, repeated, or excessive cursors fail the operation closed. Partial publication retries use the original snapshot, reconcile each known created media ID and association against the live complete graph, and never repeat `fileCreate` after an uncertain response. The intended published order is original media in original order followed by generated media in batch color order.
 
+A durable `create_file` intent without `createdMediaId` represents the crash window after the request may have reached Shopify but before its response could be checkpointed. Startup marks that item `uncertainCreation` and the operation `conflict`; the partial retry path applies the same check independently. This state cannot return to automatic file creation.
+
 Rollback compares the complete live variant-media graph with the expected operation state before mutation. Because Shopify Admin GraphQL 2026-10 does not expose a complete inverse reference connection for a File, the production adapter cannot prove global exclusivity. It therefore removes only the current product reference, preserves the underlying file, and records a conflict pending manual reference verification rather than risk deleting a shared file.
+
+Rollback records `productRestored` independently from `cleanupConflicts`. This distinguishes a product whose original ordering and variant associations are fully restored from residual operation-created files that were deliberately preserved because exclusive ownership could not be proven.

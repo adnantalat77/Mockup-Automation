@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { AbandonReadiness, ApiError, ImageAsset, MockupBatch, PublicationOperation, PublishReadiness, RecoveryReadiness, ShopifyProductDetail, ShopifyProductSummary, ShopifyStatus } from '@mockup-automation/shared';
 import { validateAndRefreshHistory } from './publishing-state.js';
 
@@ -54,13 +54,14 @@ function UploadCard({ title, hint, accept, endpoint, asset, onAsset }: { title: 
   </div>;
 }
 
-function ShopifyProductPanel({ onGarment, onProduct }: { onGarment: (asset: ImageAsset) => void; onProduct: (product: ShopifyProductDetail) => void }) {
+function ShopifyProductPanel({ onProduct }: { onProduct: (product: ShopifyProductDetail) => void }) {
   const [status, setStatus] = useState<ShopifyStatus>({ configured: false, connected: false, scopes: [] });
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<ShopifyProductSummary[]>([]);
   const [product, setProduct] = useState<ShopifyProductDetail>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [importedSource, setImportedSource] = useState<ImageAsset>();
 
   useEffect(() => {
     void apiJson<ShopifyStatus>('/api/shopify/status')
@@ -76,7 +77,7 @@ function ShopifyProductPanel({ onGarment, onProduct }: { onGarment: (asset: Imag
   }
 
   async function select(id: string) {
-    setBusy(true); setError('');
+    setBusy(true); setError(''); setImportedSource(undefined);
     try { const selected = await apiJson<ShopifyProductDetail>(`/api/shopify/product?id=${encodeURIComponent(id)}`); setProduct(selected); onProduct(selected); }
     catch (cause) { setError(cause instanceof Error ? cause.message : 'Product details could not be loaded.'); }
     finally { setBusy(false); }
@@ -87,7 +88,7 @@ function ShopifyProductPanel({ onGarment, onProduct }: { onGarment: (asset: Imag
     setBusy(true); setError('');
     try {
       const asset = await apiJson<ImageAsset>('/api/shopify/images/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ productId: product.id, imageId }) });
-      onGarment(asset);
+      setImportedSource(asset);
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'Shopify image import failed.'); }
     finally { setBusy(false); }
   }
@@ -95,14 +96,14 @@ function ShopifyProductPanel({ onGarment, onProduct }: { onGarment: (asset: Imag
   const label = status.connected ? `Connected · ${status.shop}` : status.configured ? 'Connection unavailable' : 'Not configured';
   return <section className={`panel ${status.connected ? '' : 'disabled'}`}>
     <div className="section-number">01</div>
-    <div className="section-heading"><div><h2>Product Selection</h2><p>Read-only Shopify catalog lookup. No product data can be changed.</p></div><span className={status.connected ? 'local' : 'future'}>{label}</span></div>
-    {!status.connected && <div className="notice">{status.error ?? 'Add optional Shopify server credentials to enable Phase 2 search. Manual garment upload remains available below.'}</div>}
+    <div className="section-heading"><div><h2>Shopify Product Selection</h2><p>Read-only Shopify catalog lookup. No product data can be changed.</p></div><span className={status.connected ? 'local' : 'future'}>{label}</span></div>
+    {!status.connected && <div className="notice">{status.error ?? 'Add optional Shopify server credentials to enable product search and bulk generation.'}</div>}
     <form className="search-row" onSubmit={(event) => { event.preventDefault(); void search(); }}><input value={query} onChange={(event) => setQuery(event.target.value)} disabled={!status.connected || busy} placeholder="Exact Shopify product title"/><button disabled={!status.connected || busy || query.trim().length < 2}>{busy ? 'Loading…' : 'Search Shopify'}</button></form>
     {error && <div className="error" role="alert">{error}</div>}
     {results.length > 0 && <div className="product-results">{results.map((result) => <button type="button" className="product-result" key={result.id} onClick={() => void select(result.id)} disabled={busy}>{result.imageUrl ? <img src={result.imageUrl} alt=""/> : <span className="result-placeholder">◇</span>}<span><strong>{result.title}</strong><small>{result.status} · {result.handle}</small></span></button>)}</div>}
     {product && <div className="product-detail"><div className="product-summary"><div><span className="eyebrow">SELECTED PRODUCT</span><h3>{product.title}</h3></div><div><strong>{product.colors.length}</strong><small> colors</small> · <strong>{product.variants.length}</strong><small> variants</small></div></div>
       <div className="chips">{product.colors.map((color) => <span key={color}>{color}</span>)}{product.colors.length === 0 && <span>Color option not identified</span>}</div>
-      <h4>Product images</h4><div className="shopify-images">{product.images.map((image) => <article key={image.id} className="shopify-image"><div className="shopify-image-frame"><img src={image.url} alt={image.altText ?? 'Shopify product image'}/></div><div><span className={`validation ${image.validation}`}>{image.validation}</span><p>{image.association === 'reliable' ? `Associated: ${image.associatedColors.join(', ')}` : image.association === 'ambiguous' ? 'Manual review: shared across colors' : 'Manual review: no reliable color association'}</p><button type="button" disabled={busy || image.validation !== 'transparent'} onClick={() => void useImage(image.id)}>Use transparent source</button></div></article>)}</div>
+      <h4>Product images</h4>{importedSource && <div className="success" role="status">Imported locally: {importedSource.originalName}. The Shopify original was not changed.</div>}<div className="shopify-images">{product.images.map((image) => <article key={image.id} className="shopify-image"><div className="shopify-image-frame"><img src={image.url} alt={image.altText ?? 'Shopify product image'}/></div><div><span className={`validation ${image.validation}`}>{image.validation}</span><p>{image.association === 'reliable' ? `Associated: ${image.associatedColors.join(', ')}` : image.association === 'ambiguous' ? 'Manual review: shared across colors' : 'Manual review: no reliable color association'}</p><button type="button" disabled={busy || image.validation !== 'transparent'} onClick={() => void useImage(image.id)}>Import transparent source</button></div></article>)}</div>
     </div>}
   </section>;
 }
@@ -137,7 +138,7 @@ function BatchPanel({ product, background, onBatch }: { product?: ShopifyProduct
   async function cancel() { if (batch) setBatch(await apiJson<MockupBatch>(`/api/batches/${batch.id}/cancel`, { method: 'POST' })); }
   async function regenerate(color: string) { if (batch) setBatch(await apiJson<MockupBatch>(`/api/batches/${batch.id}/regenerate`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ color }) })); }
 
-  return <section className="panel"><div className="section-number">04</div><div className="section-heading"><div><h2>Bulk Mockup Generation</h2><p>Generate one preview for every color with exactly one reliable transparent source.</p></div><button className="primary" disabled={!product || !background || busy || batch?.status === 'running'} onClick={() => void createBatch()}>{busy ? 'Preparing…' : 'Generate All Mockups'}</button></div>
+  return <section className="panel"><div className="section-number">03</div><div className="section-heading"><div><h2>Bulk Mockup Generation</h2><p>Generate one preview for every color with exactly one reliable transparent source.</p></div><button className="primary" disabled={!product || !background || busy || batch?.status === 'running'} onClick={() => void createBatch()}>{busy ? 'Preparing…' : 'Generate All Mockups'}</button></div>
     {!product || !background ? <div className="notice">Select a Shopify product and upload a background to enable batch generation.</div> : null}
     {error && <div className="error">{error}</div>}
     {batch && <div className="batch-workspace"><div className="batch-status"><strong>{batch.status}</strong><span>{batch.counts.success} succeeded</span><span>{batch.counts.failed} failed</span><span>{batch.counts.skipped} skipped</span><span>{batch.counts.processing + batch.counts.queued} remaining</span>{batch.status === 'running' && <button onClick={() => void cancel()}>Cancel safely</button>}{batch.counts.success > 0 && <a className="download-button" href={`${apiBase}/api/batches/${batch.id}/download`}>Download ZIP</a>}</div>
@@ -225,7 +226,7 @@ function PublishingPanel({ batch, product }: { batch?: MockupBatch; product?: Sh
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'Abandonment failed.'); }
     finally { setBusy(false); }
   }
-  return <section className={`panel ${status.enabled ? '' : 'disabled'}`}><div className="section-number">05</div><div className="section-heading"><div><h2>Publishing and Rollback</h2><p>Explicitly validate, approve, publish, and restore a completed batch.</p></div><span className={status.enabled ? 'local' : 'future'}>{status.enabled ? 'Server enabled' : 'Disabled by default'}</span></div>
+  return <section className={`panel ${status.enabled ? '' : 'disabled'}`}><div className="section-number">04</div><div className="section-heading"><div><h2>Publishing and Rollback</h2><p>Explicitly validate, approve, publish, and restore a completed batch.</p></div><span className={status.enabled ? 'local' : 'future'}>{status.enabled ? 'Server enabled' : 'Disabled by default'}</span></div>
     {!status.enabled && <div className="notice">{status.reason ?? 'Publishing is disabled.'}</div>}
     <div className="publish-auth"><input type="password" autoComplete="off" placeholder="Local publishing authorization" value={authorization} onChange={(event) => setAuthorization(event.target.value)} disabled={!status.enabled}/><button disabled={!status.enabled || !authorization || busy} onClick={() => void refreshHistorySafely()}>Load publication history</button><button disabled={!status.enabled || !authorization || !batch || busy} onClick={() => void validate()}>Validate new publication</button></div>
     {error && <div className="error">{error}</div>}
@@ -240,40 +241,17 @@ function PublishingPanel({ batch, product }: { batch?: MockupBatch; product?: Sh
 
 export function App() {
   const [background, setBackground] = useState<ImageAsset>();
-  const [garment, setGarment] = useState<ImageAsset>();
-  const [preview, setPreview] = useState<ImageAsset>();
   const [selectedProduct, setSelectedProduct] = useState<ShopifyProductDetail>();
   const [latestBatch, setLatestBatch] = useState<MockupBatch>();
-  const [message, setMessage] = useState('');
-  const [generating, setGenerating] = useState(false);
-  const ready = Boolean(background && garment);
-  const generatedUrl = useMemo(() => assetUrl(preview), [preview]);
-
-  async function generate() {
-    if (!background || !garment) return;
-    setGenerating(true); setMessage(''); setPreview(undefined);
-    try {
-      const response = await fetch(`${apiBase}/api/previews`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ backgroundId: background.id, garmentId: garment.id }) });
-      const result = await response.json() as ImageAsset | ApiError;
-      if (!response.ok) throw new Error((result as ApiError).error);
-      setPreview(result as ImageAsset); setMessage('Preview generated. Source images were preserved.');
-    } catch (cause) { setMessage(cause instanceof Error ? cause.message : 'Preview generation failed.'); }
-    finally { setGenerating(false); }
-  }
 
   return <div className="shell">
     <header><div className="brand-mark">EW</div><div><p className="eyebrow">EQUIPD WEAR</p><h1>Mockup Automation</h1></div><span className="phase">Phase 3 · Batch preview</span></header>
     <main>
-      <section className="hero"><div><p className="eyebrow">COMPOSITE WORKSPACE</p><h2>Build listing-ready previews without changing the garment.</h2><p>Layer an original transparent apparel PNG over your own background. Every source stays untouched.</p></div><div className="guardrail"><span>✦</span><div><strong>Pixel-preservation rule</strong><p>No AI edits, recoloring, background removal, cropping, or distortion.</p></div></div></section>
-      <ShopifyProductPanel onProduct={setSelectedProduct} onGarment={(value) => { setGarment(value); setPreview(undefined); setMessage('Shopify source imported locally. The remote original was not changed.'); }}/>
-      <section className="panel"><div className="section-number">02</div><div className="section-heading"><div><h2>Background Selection</h2><p>Upload one local scene. Manual garment upload remains available as Phase 1 test mode.</p></div><span className="local">Local files</span></div><div className="upload-grid"><UploadCard title="Background image" hint="JPEG or PNG · up to 12 MB" accept="image/jpeg,image/png" endpoint="/api/backgrounds" asset={background} onAsset={(value) => { setBackground(value); setPreview(undefined); }}/><UploadCard title="Manual garment test mode" hint="PNG · transparency is verified pixel-by-pixel" accept="image/png" endpoint="/api/garments" asset={garment} onAsset={(value) => { setGarment(value); setPreview(undefined); }}/></div></section>
-      <section className="panel"><div className="section-number">03</div><div className="section-heading"><div><h2>Mockup Preview</h2><p>Compare the unchanged source with the generated composite.</p></div><button className="primary" disabled={!ready || generating} onClick={() => void generate()}>{generating ? 'Generating…' : 'Generate Preview'}</button></div><div className="preview-grid"><Preview title="Original garment" src={assetUrl(garment)} empty="Upload a transparent garment PNG" checker/><Preview title="Generated preview" src={generatedUrl} empty={ready ? 'Select Generate Preview' : 'Add both source images'}/></div>{message && <div className={preview ? 'success' : 'error'} role="status">{message}</div>}</section>
+      <section className="hero"><div><p className="eyebrow">COMPOSITE WORKSPACE</p><h2>Build listing-ready previews without changing the garment.</h2><p>Combine reliably mapped Shopify garment sources with your selected background. Every source stays untouched.</p></div><div className="guardrail"><span>✦</span><div><strong>Pixel-preservation rule</strong><p>No AI edits, recoloring, background removal, cropping, or distortion.</p></div></div></section>
+      <ShopifyProductPanel onProduct={setSelectedProduct}/>
+      <section className="panel"><div className="section-number">02</div><div className="section-heading"><div><h2>Background Selection</h2><p>Upload the local JPEG or PNG scene used for bulk mockup generation.</p></div><span className="local">Local file</span></div><div className="upload-grid"><UploadCard title="Background image" hint="JPEG or PNG · up to 12 MB" accept="image/jpeg,image/png" endpoint="/api/backgrounds" asset={background} onAsset={setBackground}/></div></section>
       <BatchPanel product={selectedProduct} background={background} onBatch={setLatestBatch}/>
       <PublishingPanel batch={latestBatch} product={selectedProduct}/>
     </main><footer>Local processing only · Equipd Wear · Source files remain unchanged</footer>
   </div>;
-}
-
-function Preview({ title, src, empty, checker = false }: { title: string; src: string; empty: string; checker?: boolean }) {
-  return <figure><figcaption>{title}</figcaption><div className={`image-frame ${checker ? 'checker' : ''}`}>{src ? <img src={src} alt={title}/> : <div className="empty"><span>◇</span><p>{empty}</p></div>}</div></figure>;
 }

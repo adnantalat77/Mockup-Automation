@@ -1,6 +1,6 @@
 # Mockup-Automation
 
-Local Windows application for Equipd Wear. Phase 1 composites an original transparent apparel PNG over a user-supplied JPEG/PNG background. Phase 2 adds optional read-only Shopify catalog access. Phase 3 generates and reviews one local preview per reliably mapped garment color. Phase 4 adds guarded bulk publishing and recovery, disabled by default.
+Local Windows application for Equipd Wear. The primary workflow selects a Shopify product, uploads one background, generates and reviews a preview for each reliably mapped garment color, and optionally uses guarded publishing and recovery. Publishing remains disabled by default.
 
 ## Prerequisites
 
@@ -33,9 +33,12 @@ These commands are root scripts backed by npm workspaces. `npm test` runs API im
 
 ## Local workflow
 
-1. Upload a JPEG or PNG background (maximum 12 MB by default).
-2. Upload an original transparent garment PNG. The server verifies a meaningful number of actual alpha pixel values; a `.png` suffix or a few stray transparent edge pixels is not enough. Partially transparent antialiased pixels count as transparency.
-3. Select **Generate Preview** and compare the original garment to the generated PNG.
+1. Connect Shopify and select a product through the read-only catalog search.
+2. Upload one JPEG or PNG background (maximum 12 MB by default).
+3. Select **Generate All Mockups** to create previews for every reliably mapped transparent garment source.
+4. Review or regenerate individual color cards, download the completed ZIP, and separately validate publishing readiness when publishing is enabled.
+
+The legacy manual garment upload and standalone two-image preview are no longer shown in the dashboard. Their backend validation and Sharp compositing services remain available for automated tests and are reused by bulk generation.
 
 ## Optional Shopify read-only setup
 
@@ -50,9 +53,9 @@ SHOPIFY_CLIENT_SECRET=...
 SHOPIFY_API_VERSION=2026-10
 ```
 
-Restart `npm run dev`. The backend exchanges these credentials for a short-lived token, caches it only in memory, refreshes it shortly before expiry, and checks for `read_products`. Credentials and tokens never enter browser responses or application logs. If the variables are absent, manual Phase 1 operation continues unchanged.
+Restart `npm run dev`. The backend exchanges these credentials for a short-lived token, caches it only in memory, refreshes it shortly before expiry, and checks for `read_products`. Credentials and tokens never enter browser responses or application logs. If the variables are absent, the local server and background upload remain available, but the primary product-selection and bulk-generation workflow cannot start.
 
-Product image-to-color mappings are considered reliable only when Shopify exposes a direct variant image or media association. Shared and unassociated images are marked for manual review. A Shopify image must pass the same decoded-format and meaningful-alpha validation as a manual garment before it can be used for preview generation.
+Product image-to-color mappings are considered reliable only when Shopify exposes a direct variant image or media association. Shared and unassociated images are marked for manual review. A Shopify image must pass decoded-format and meaningful-alpha validation before it can be used for preview generation.
 
 ## Bulk mockup generation
 
@@ -94,7 +97,7 @@ Published ordering is deterministic: all original media remain in their original
 - EXIF orientation is normalized before background dimensions are chosen, so rotated portrait JPEGs produce portrait previews without stretching.
 - The garment is centered and proportionally downscaled only if necessary to fit. It is never cropped or nonuniformly scaled.
 - Uploaded files are available through strict RFC-compatible UUID-validated API routes, not a public source directory.
-- A failed replacement upload retains the previously validated selection and preview and labels that state explicitly.
+- A failed background replacement retains the previously validated background and labels that state explicitly.
 - Current dependency-audit findings and deferred breaking remediations are recorded in [docs/SECURITY.md](docs/SECURITY.md).
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the service boundary and image guarantees.

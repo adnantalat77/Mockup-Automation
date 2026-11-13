@@ -83,3 +83,40 @@ export interface MockupBatch {
   items: MockupBatchItem[];
   counts: { total: number; queued: number; processing: number; success: number; failed: number; skipped: number; cancelled: number };
 }
+
+export type PublicationStatus = 'validated' | 'publishing' | 'published' | 'partial' | 'rolling_back' | 'rolled_back' | 'rollback_partial' | 'conflict';
+
+export interface PublicationItem {
+  color: string;
+  previewId: string;
+  variantIds: string[];
+  createdMediaId?: string;
+  status: 'pending' | 'uploaded' | 'associated' | 'failed' | 'rolled_back';
+  error?: string;
+}
+
+export interface PublicationOperation {
+  id: string;
+  version: 1;
+  batchId: string;
+  productId: string;
+  productTitle: string;
+  createdAt: string;
+  updatedAt: string;
+  status: PublicationStatus;
+  originalMediaOrder: string[];
+  originalVariantMedia: Array<{ variantId: string; mediaIds: string[] }>;
+  items: PublicationItem[];
+  completedSteps: string[];
+  errors: string[];
+}
+
+export interface PublishReadiness {
+  ready: boolean;
+  batchId: string;
+  productId: string;
+  imageCount: number;
+  variantCount: number;
+  colors: Array<{ color: string; variantCount: number; previewId: string }>;
+  errors: string[];
+}

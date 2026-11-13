@@ -1,4 +1,5 @@
 import express from 'express';
+import crypto from 'node:crypto';
 import cors from 'cors';
 import helmet from 'helmet';
 import multer from 'multer';
@@ -9,6 +10,7 @@ import { analyzeTransparency, compositePreview, ImageValidationError, inspectIma
 import { loadConfig, type AppConfig } from './config.js';
 import { ShopifyError, ShopifyService } from './services/shopify.js';
 import { BatchError, BatchService } from './services/batches.js';
+import { PublicationError, PublishingService } from './services/publishing.js';
 
 export async function createApp(overrides: Partial<AppConfig> = {}) {
   const config = loadConfig(overrides);
@@ -22,13 +24,15 @@ export async function createApp(overrides: Partial<AppConfig> = {}) {
   }
   const batches = shopify ? new BatchService(config.dataDir, store, shopify) : undefined;
   if (batches) await batches.init();
+  const publishing = shopify && batches ? new PublishingService(config.dataDir, store, batches, shopify) : undefined;
+  if (publishing) await publishing.init();
   const app = express();
   app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
   app.use(cors({ origin: config.webOrigin }));
   app.use(express.json({ limit: '64kb' }));
   const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: config.maxUploadBytes, files: 1 } });
 
-  app.get('/api/health', (_request, response) => response.json({ status: 'ok', phase: 2 }));
+  app.get('/api/health', (_request, response) => response.json({ status: 'ok', phase: 4 }));
 
   app.get('/api/shopify/status', async (_request, response) => {
     if (!shopify) return response.json({ configured: false, connected: false, scopes: [], error: shopifySetupError });
@@ -106,6 +110,62 @@ export async function createApp(overrides: Partial<AppConfig> = {}) {
     } catch (error) { next(error); }
   });
 
+  const requiredPublishingScopes = ['read_products', 'write_products', 'write_files'];
+
+  const verifyPublishingScopes = async () => {
+    if (!shopify) throw new PublicationError('Shopify is not configured.', 503);
+    const status = await shopify.status();
+    const missing = requiredPublishingScopes.filter((scope) => !status.scopes.includes(scope));
+    if (missing.length) throw new PublicationError(`Shopify is missing required publishing scopes: ${missing.join(', ')}.`, 403);
+  };
+
+  app.get('/api/publishing/status', async (_request, response) => {
+    if (!config.publishingEnabled) return response.json({ enabled: false, reason: 'Publishing is disabled by the server feature flag.' });
+    if (!publishing) return response.json({ enabled: false, reason: 'Shopify is not configured.' });
+    if (!config.publishingAuthToken || config.publishingAuthToken.length < 32) return response.json({ enabled: false, reason: 'Publishing authorization is not configured securely.' });
+    try { await verifyPublishingScopes(); return response.json({ enabled: true }); }
+    catch (error) { return response.json({ enabled: false, reason: error instanceof Error ? error.message : 'Publishing scope verification failed.' }); }
+  });
+
+  const authorizePublishing = (request: express.Request) => {
+    if (!config.publishingEnabled) throw new PublicationError('Shopify publishing is disabled by the server.', 403);
+    if (!publishing || !config.publishingAuthToken || config.publishingAuthToken.length < 32) throw new PublicationError('Shopify publishing is not configured securely.', 403);
+    const origin = request.get('origin');
+    const allowedOrigins = new Set([config.webOrigin, 'http://127.0.0.1:3000', 'http://localhost:3000']);
+    if (!origin || !allowedOrigins.has(origin)) throw new PublicationError('Publishing request origin was rejected.', 403);
+    const supplied = request.get('x-publish-authorization') ?? '';
+    const expected = Buffer.from(config.publishingAuthToken); const actual = Buffer.from(supplied);
+    if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) throw new PublicationError('Publishing authorization failed.', 401);
+  };
+
+  app.post('/api/publishing/validate', async (request, response, next) => {
+    try { authorizePublishing(request); await verifyPublishingScopes(); response.json(await publishing!.validate(String(request.body?.batchId ?? ''))); }
+    catch (error) { next(error); }
+  });
+
+  app.post('/api/publishing/publish', async (request, response, next) => {
+    try {
+      authorizePublishing(request);
+      await verifyPublishingScopes();
+      if (request.body?.confirm !== 'PUBLISH') throw new PublicationError('Explicit publish confirmation is required.', 400);
+      response.json(await publishing!.publish(String(request.body?.batchId ?? '')));
+    } catch (error) { next(error); }
+  });
+
+  app.get('/api/publishing/operations', async (request, response, next) => {
+    try { authorizePublishing(request); await verifyPublishingScopes(); response.json(publishing!.list()); }
+    catch (error) { next(error); }
+  });
+
+  app.post('/api/publishing/:id/rollback', async (request, response, next) => {
+    try {
+      authorizePublishing(request);
+      await verifyPublishingScopes();
+      if (request.body?.confirm !== 'ROLLBACK') throw new PublicationError('Explicit rollback confirmation is required.', 400);
+      response.json(await publishing!.rollback(request.params.id));
+    } catch (error) { next(error); }
+  });
+
   app.post('/api/backgrounds', upload.single('image'), async (request, response, next) => {
     try {
       if (!request.file) throw new ImageValidationError('Choose a JPEG or PNG background.');
@@ -158,6 +218,7 @@ export async function createApp(overrides: Partial<AppConfig> = {}) {
     if (error instanceof multer.MulterError && error.code === 'LIMIT_FILE_SIZE') return response.status(413).json({ error: `Image exceeds the ${Math.round(config.maxUploadBytes / 1024 / 1024)} MB limit.` });
     if (error instanceof ShopifyError) return response.status(error.status).json({ error: error.message });
     if (error instanceof BatchError) return response.status(error.status).json({ error: error.message });
+    if (error instanceof PublicationError) return response.status(error.status).json({ error: error.message });
     const clientError = error instanceof ImageValidationError || error?.message === 'Asset not found.';
     response.status(clientError ? 400 : 500).json({ error: clientError ? error.message : 'The request could not be completed.' });
   });

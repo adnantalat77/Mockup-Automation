@@ -129,3 +129,10 @@ describe('compositing', () => {
     expect((await readFile(path.join(dataDir, 'uploads', 'garments', garmentFiles[0]))).equals(garment)).toBe(true);
   });
 });
+
+describe('publishing authorization', () => {
+  it('rejects publication while the server feature flag is disabled', async () => {
+    const response = await request(app).post('/api/publishing/publish').set('Origin', 'http://127.0.0.1:3000').set('X-Publish-Authorization', 'not-authorized').send({ batchId: '00000000-0000-4000-8000-000000000000', confirm: 'PUBLISH' });
+    expect(response.status).toBe(403);
+  });
+});

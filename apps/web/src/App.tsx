@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { ApiError, ImageAsset, MockupBatch, ShopifyProductDetail, ShopifyProductSummary, ShopifyStatus } from '@mockup-automation/shared';
+import type { ApiError, ImageAsset, MockupBatch, PublicationOperation, PublishReadiness, ShopifyProductDetail, ShopifyProductSummary, ShopifyStatus } from '@mockup-automation/shared';
 
 // Development stays same-origin through Vite's /api proxy. A production host
 // can provide VITE_API_URL when the deployed API has a separate origin.
@@ -105,10 +105,12 @@ function ShopifyProductPanel({ onGarment, onProduct }: { onGarment: (asset: Imag
   </section>;
 }
 
-function BatchPanel({ product, background }: { product?: ShopifyProductDetail; background?: ImageAsset }) {
+function BatchPanel({ product, background, onBatch }: { product?: ShopifyProductDetail; background?: ImageAsset; onBatch: (batch: MockupBatch) => void }) {
   const [batch, setBatch] = useState<MockupBatch>();
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+
+  useEffect(() => { if (batch) onBatch(batch); }, [batch, onBatch]);
 
   useEffect(() => {
     void apiJson<MockupBatch[]>('/api/batches').then((saved) => { if (saved[0]) setBatch(saved[0]); }).catch(() => { /* Shopify can be intentionally unconfigured. */ });
@@ -143,11 +145,47 @@ function BatchPanel({ product, background }: { product?: ShopifyProductDetail; b
   </section>;
 }
 
+function PublishingPanel({ batch, product }: { batch?: MockupBatch; product?: ShopifyProductDetail }) {
+  const [status, setStatus] = useState<{ enabled: boolean; reason?: string }>({ enabled: false });
+  const [authorization, setAuthorization] = useState('');
+  const [readiness, setReadiness] = useState<PublishReadiness>();
+  const [history, setHistory] = useState<PublicationOperation[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => { void apiJson<{ enabled: boolean; reason?: string }>('/api/publishing/status').then(setStatus); }, []);
+  const authorized = (path: string, init: RequestInit = {}) => apiJson<any>(path, { ...init, headers: { 'Content-Type': 'application/json', 'X-Publish-Authorization': authorization, ...(init.headers ?? {}) } });
+  async function refreshHistory() { if (authorization) setHistory(await authorized('/api/publishing/operations')); }
+  async function validate() { if (!batch) return; setBusy(true); setError(''); try { setReadiness(await authorized('/api/publishing/validate', { method: 'POST', body: JSON.stringify({ batchId: batch.id }) })); await refreshHistory(); } catch (cause) { setError(cause instanceof Error ? cause.message : 'Validation failed.'); } finally { setBusy(false); } }
+  async function publish() {
+    if (!batch || !readiness?.ready || !window.confirm(`Publish ${readiness.imageCount} images and update ${readiness.variantCount} variants?`)) return;
+    setBusy(true); setError('');
+    const timer = window.setInterval(() => void refreshHistory().catch(() => undefined), 750);
+    try { await authorized('/api/publishing/publish', { method: 'POST', body: JSON.stringify({ batchId: batch.id, confirm: 'PUBLISH' }) }); await refreshHistory(); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : 'Publication failed.'); }
+    finally { window.clearInterval(timer); setBusy(false); }
+  }
+  async function rollback(operation: PublicationOperation) {
+    if (!window.confirm('Restore original variant associations and remove only media created by this operation?')) return;
+    setBusy(true); setError(''); try { await authorized(`/api/publishing/${operation.id}/rollback`, { method: 'POST', body: JSON.stringify({ confirm: 'ROLLBACK' }) }); await refreshHistory(); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : 'Rollback failed.'); } finally { setBusy(false); }
+  }
+  return <section className={`panel ${status.enabled ? '' : 'disabled'}`}><div className="section-number">05</div><div className="section-heading"><div><h2>Publishing and Rollback</h2><p>Explicitly validate, approve, publish, and restore a completed batch.</p></div><span className={status.enabled ? 'local' : 'future'}>{status.enabled ? 'Server enabled' : 'Disabled by default'}</span></div>
+    {!status.enabled && <div className="notice">{status.reason ?? 'Publishing is disabled.'}</div>}
+    <div className="publish-auth"><input type="password" autoComplete="off" placeholder="Local publishing authorization" value={authorization} onChange={(event) => setAuthorization(event.target.value)} disabled={!status.enabled}/><button disabled={!status.enabled || !authorization || !batch || busy} onClick={() => void validate()}>Validate readiness</button></div>
+    {error && <div className="error">{error}</div>}
+    {readiness && <div className={readiness.ready ? 'success' : 'error'}>{readiness.ready ? `${readiness.imageCount} images and ${readiness.variantCount} variants are ready.` : readiness.errors.join(' ')}</div>}
+    {readiness?.ready && batch && <><div className="publish-review">{readiness.colors.map((entry) => { const item = batch.items.find((candidate) => candidate.color === entry.color); const before = product?.images.find((image) => image.id === item?.sourceImageId); return <article key={entry.color}><h3>{entry.color}</h3><div><figure><figcaption>Before</figcaption>{before ? <img src={before.url} alt="Original Shopify source"/> : <span>Unavailable</span>}</figure><figure><figcaption>After</figcaption>{item?.preview ? <img src={assetUrl(item.preview)} alt="Generated preview"/> : <span>Unavailable</span>}</figure></div><p>{entry.variantCount} variants affected</p></article>; })}</div><button className="primary" disabled={busy} onClick={() => void publish()}>{busy ? 'Operation in progress…' : 'Publish All'}</button></>}
+    {history.length > 0 && <div className="publication-history"><h3>Publication history</h3>{history.map((operation) => <article key={operation.id}><div><strong>{operation.productTitle}</strong><span>{operation.status}</span><small>{new Date(operation.updatedAt).toLocaleString()}</small></div><div>{operation.items.map((item) => <span key={item.color}>{item.color}: {item.status}</span>)}</div>{['published','partial','rollback_partial','conflict'].includes(operation.status) && <button disabled={busy} onClick={() => void rollback(operation)}>Restore Original Images</button>}</article>)}</div>}
+  </section>;
+}
+
 export function App() {
   const [background, setBackground] = useState<ImageAsset>();
   const [garment, setGarment] = useState<ImageAsset>();
   const [preview, setPreview] = useState<ImageAsset>();
   const [selectedProduct, setSelectedProduct] = useState<ShopifyProductDetail>();
+  const [latestBatch, setLatestBatch] = useState<MockupBatch>();
   const [message, setMessage] = useState('');
   const [generating, setGenerating] = useState(false);
   const ready = Boolean(background && garment);
@@ -172,8 +210,8 @@ export function App() {
       <ShopifyProductPanel onProduct={setSelectedProduct} onGarment={(value) => { setGarment(value); setPreview(undefined); setMessage('Shopify source imported locally. The remote original was not changed.'); }}/>
       <section className="panel"><div className="section-number">02</div><div className="section-heading"><div><h2>Background Selection</h2><p>Upload one local scene. Manual garment upload remains available as Phase 1 test mode.</p></div><span className="local">Local files</span></div><div className="upload-grid"><UploadCard title="Background image" hint="JPEG or PNG · up to 12 MB" accept="image/jpeg,image/png" endpoint="/api/backgrounds" asset={background} onAsset={(value) => { setBackground(value); setPreview(undefined); }}/><UploadCard title="Manual garment test mode" hint="PNG · transparency is verified pixel-by-pixel" accept="image/png" endpoint="/api/garments" asset={garment} onAsset={(value) => { setGarment(value); setPreview(undefined); }}/></div></section>
       <section className="panel"><div className="section-number">03</div><div className="section-heading"><div><h2>Mockup Preview</h2><p>Compare the unchanged source with the generated composite.</p></div><button className="primary" disabled={!ready || generating} onClick={() => void generate()}>{generating ? 'Generating…' : 'Generate Preview'}</button></div><div className="preview-grid"><Preview title="Original garment" src={assetUrl(garment)} empty="Upload a transparent garment PNG" checker/><Preview title="Generated preview" src={generatedUrl} empty={ready ? 'Select Generate Preview' : 'Add both source images'}/></div>{message && <div className={preview ? 'success' : 'error'} role="status">{message}</div>}</section>
-      <BatchPanel product={selectedProduct} background={background}/>
-      <section className="panel disabled"><div className="section-number">05</div><div className="section-heading"><div><h2>Publishing</h2><p>Shopify writes, variant association, and rollback remain unavailable.</p></div><span className="future">Disabled</span></div><div className="publish-row"><button disabled>Publish to Shopify</button><button disabled>Restore original images</button></div></section>
+      <BatchPanel product={selectedProduct} background={background} onBatch={setLatestBatch}/>
+      <PublishingPanel batch={latestBatch} product={selectedProduct}/>
     </main><footer>Local processing only · Equipd Wear · Source files remain unchanged</footer>
   </div>;
 }

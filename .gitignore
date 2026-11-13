@@ -11,6 +11,7 @@ dist/
 **/data/uploads/**
 **/data/generated/**
 **/data/batches/**
+**/data/publications/**
 !data/uploads/.gitkeep
 !data/generated/.gitkeep
 *.log

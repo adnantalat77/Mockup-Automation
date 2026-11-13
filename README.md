@@ -1,6 +1,6 @@
 # Mockup-Automation
 
-Local Windows application for Equipd Wear. Phase 1 composites an original transparent apparel PNG over a user-supplied JPEG/PNG background. Phase 2 adds optional read-only Shopify catalog access. Phase 3 generates and reviews one local preview per reliably mapped garment color. Shopify publishing remains disabled.
+Local Windows application for Equipd Wear. Phase 1 composites an original transparent apparel PNG over a user-supplied JPEG/PNG background. Phase 2 adds optional read-only Shopify catalog access. Phase 3 generates and reviews one local preview per reliably mapped garment color. Phase 4 adds guarded bulk publishing and recovery, disabled by default.
 
 ## Prerequisites
 
@@ -62,10 +62,18 @@ At most two colors are processed concurrently, a batch is limited to 50 colors, 
 
 Local source assets are stored beneath ignored `data/uploads/`; generated previews are stored beneath ignored `data/generated/`. Files receive generated UUID names. To change limits or ports, copy `.env.example` to `.env` and edit local values.
 
+## Phase 4 publishing and recovery
+
+Publishing remains unavailable unless all three server-side gates pass: `SHOPIFY_PUBLISHING_ENABLED=true`, a private `SHOPIFY_PUBLISHING_AUTH_TOKEN` of at least 32 characters, and live verification of `read_products`, `write_products`, and `write_files`. The authorization value is entered only for a protected operation and sent in `X-Publish-Authorization`; it is not persisted by the browser. Mutation requests also require an approved local origin and an explicit `PUBLISH` or `ROLLBACK` confirmation value.
+
+Before publishing, the API re-fetches the product, validates every color-to-variant association and generated PNG, and writes checkpoint zero under ignored `data/publications/`. Every successful Shopify mutation creates another immutable, sequence-numbered checkpoint. Original media are retained. Rollback removes only media IDs recorded as created by that operation, restores recorded variant associations and ordering, and stops for manual review if unrelated media changed.
+
+The Shopify workflow uses staged uploads, `fileCreate`, file-processing polling, `fileUpdate` product references, `productVariantAppendMedia`/`productVariantDetachMedia`, `productReorderMedia`, and `fileDelete`. It does not use deprecated `productDeleteMedia`. See [docs/PHASE4_LIVE_TEST.md](docs/PHASE4_LIVE_TEST.md) before any separately approved live test.
+
 ## Safety and current limitations
 
-- No Shopify writes, publishing, deletion, replacement, Printful sync, AI generation, background removal, or garment recoloring.
-- Product search is read-only and enabled only after successful authentication and scope verification. Publishing controls remain disabled.
+- Shopify publishing is disabled by default and has not been exercised against a live store by the automated test suite. Product search remains available with `read_products` only.
+- No Printful sync, AI generation, background removal, garment recoloring, pricing, inventory, SKU, or fulfillment mutations.
 - Metadata is local JSON beside the assets. SQLite remains reserved for a later phase when durable relational metadata is needed.
 - EXIF orientation is normalized before background dimensions are chosen, so rotated portrait JPEGs produce portrait previews without stretching.
 - The garment is centered and proportionally downscaled only if necessary to fit. It is never cropped or nonuniformly scaled.

@@ -7,7 +7,7 @@ export interface ShopifyConfig {
   apiVersion: string;
 }
 
-export interface AppConfig { dataDir: string; maxUploadBytes: number; webOrigin: string; shopify?: ShopifyConfig; shopifyConfigurationError?: string }
+export interface AppConfig { dataDir: string; maxUploadBytes: number; webOrigin: string; shopify?: ShopifyConfig; shopifyConfigurationError?: string; publishingEnabled: boolean; publishingAuthToken?: string }
 
 export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
   const maxMb = Number(process.env.MAX_UPLOAD_MB ?? 12);
@@ -22,9 +22,11 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
   return {
     dataDir: path.resolve(process.env.DATA_DIR ?? path.join(process.cwd(), 'data')),
     maxUploadBytes: Number.isFinite(maxMb) && maxMb > 0 ? maxMb * 1024 * 1024 : 12 * 1024 * 1024,
-    webOrigin: process.env.WEB_ORIGIN ?? 'http://localhost:3000',
+    webOrigin: process.env.WEB_ORIGIN ?? 'http://127.0.0.1:3000',
     shopify,
     shopifyConfigurationError: suppliedShopifyValues > 0 && suppliedShopifyValues < 3 ? 'Shopify configuration is incomplete.' : undefined,
+    publishingEnabled: process.env.SHOPIFY_PUBLISHING_ENABLED === 'true',
+    publishingAuthToken: process.env.SHOPIFY_PUBLISHING_AUTH_TOKEN,
     ...overrides
   };
 }

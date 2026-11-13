@@ -8,6 +8,19 @@ type Fetcher = typeof fetch;
 type GraphqlResponse<T> = { data?: T; errors?: Array<{ message: string; extensions?: { code?: string } }>; extensions?: { cost?: { throttleStatus?: { currentlyAvailable?: number; restoreRate?: number } } } };
 type ImageNode = { id: string; url: string; altText?: string | null; width?: number | null; height?: number | null };
 type MediaNode = { id: string; mediaContentType: string; image?: ImageNode | null; preview?: { image?: ImageNode | null } | null };
+export interface ShopifyPublicationState { mediaIds: string[]; variants: Array<{ id: string; color?: string; mediaIds: string[] }> }
+interface PublicationStateResponse {
+  product: {
+    media: { nodes: Array<{ id: string }> };
+    variants: {
+      nodes: Array<{
+        id: string;
+        selectedOptions: Array<{ name: string; value: string }>;
+        media: { nodes: Array<{ id: string }> };
+      }>;
+    };
+  } | null;
+}
 
 const PRODUCT_GID = /^gid:\/\/shopify\/Product\/[1-9]\d*$/;
 const IMAGE_GID = /^gid:\/\/shopify\/(?:ProductImage|MediaImage)\/[1-9]\d*$/;
@@ -196,6 +209,132 @@ export class ShopifyService {
     throw new ShopifyError('Shopify image download failed.', 502, 'DOWNLOAD_FAILED');
   }
 
+  async getPublicationState(productId: string): Promise<ShopifyPublicationState> {
+    this.assertProductId(productId);
+    const product = await this.getProduct(productId, false);
+    const data = await this.graphql<PublicationStateResponse>(`
+      query PublicationState($id: ID!) {
+        product(id: $id) {
+          media(first: 250) { nodes { id } }
+          variants(first: 250) { nodes { id selectedOptions { name value } media(first: 100) { nodes { id } } } }
+        }
+      }
+    `, { id: productId });
+    if (!data.product) throw new ShopifyError('Shopify product not found.', 404, 'NOT_FOUND');
+    const color = (options: Array<{ name: string; value: string }>) => options.find((option) => ['color', 'colour'].includes(option.name.toLowerCase()))?.value;
+    const byId = new Map(product.variants.map((variant) => [variant.id, variant]));
+    return {
+      mediaIds: data.product.media.nodes.map((media) => media.id),
+      variants: data.product.variants.nodes.map((variant) => ({ id: variant.id, color: color(variant.selectedOptions) ?? byId.get(variant.id)?.color, mediaIds: variant.media.nodes.map((media) => media.id) }))
+    };
+  }
+
+  async stageImage(filename: string, bytes: Buffer) {
+    const result = await this.graphql<{ stagedUploadsCreate: { stagedTargets: Array<{ url: string; resourceUrl: string; parameters: Array<{ name: string; value: string }> }> | null; userErrors: Array<{ message: string }> } }>(`
+      mutation StageImage($input: [StagedUploadInput!]!) {
+        stagedUploadsCreate(input: $input) { stagedTargets { url resourceUrl parameters { name value } } userErrors { message } }
+      }
+    `, { input: [{ filename, mimeType: 'image/png', httpMethod: 'PUT', resource: 'PRODUCT_IMAGE' }] });
+    this.assertUserErrors(result.stagedUploadsCreate.userErrors);
+    const target = result.stagedUploadsCreate.stagedTargets?.[0];
+    if (!target) throw new ShopifyError('Shopify did not return a staged upload target.', 502, 'STAGED_UPLOAD_FAILED');
+    const uploadUrl = this.validateStagedUrl(target.url);
+    const headers = Object.fromEntries(target.parameters.map((parameter) => [parameter.name, parameter.value]));
+    const uploaded = await this.fetcher(uploadUrl, { method: 'PUT', headers, body: new Uint8Array(bytes), redirect: 'error', signal: AbortSignal.timeout(30_000) });
+    if (!uploaded.ok) throw new ShopifyError(`Shopify staged upload failed with status ${uploaded.status}.`, 502, 'STAGED_UPLOAD_FAILED');
+    return target.resourceUrl;
+  }
+
+  async createImageFile(resourceUrl: string, alt: string) {
+    const result = await this.graphql<{ fileCreate: { files: Array<{ id: string; fileStatus: string }> | null; userErrors: Array<{ message: string }> } }>(`
+      mutation CreateImageFile($files: [FileCreateInput!]!) {
+        fileCreate(files: $files) { files { id fileStatus } userErrors { message } }
+      }
+    `, { files: [{ originalSource: resourceUrl, contentType: 'IMAGE', alt, duplicateResolutionMode: 'APPEND_UUID' }] });
+    this.assertUserErrors(result.fileCreate.userErrors);
+    const file = result.fileCreate.files?.[0];
+    if (!file?.id) throw new ShopifyError('Shopify did not create the image file.', 502, 'FILE_CREATE_FAILED');
+    return file;
+  }
+
+  async waitForFileReady(fileId: string, attempts = 20) {
+    this.assertMediaId(fileId);
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      const data = await this.graphql<{ node: { id: string; fileStatus: string; fileErrors: Array<{ message: string }> } | null }>(`
+        query FileStatus($id: ID!) { node(id: $id) { ... on MediaImage { id fileStatus fileErrors { message } } } }
+      `, { id: fileId });
+      if (data.node?.fileStatus === 'READY') return;
+      if (!data.node || data.node.fileStatus === 'FAILED') throw new ShopifyError(data.node?.fileErrors?.[0]?.message ?? 'Shopify media processing failed.', 502, 'MEDIA_PROCESSING_FAILED');
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    throw new ShopifyError('Shopify media processing timed out.', 504, 'MEDIA_PROCESSING_TIMEOUT');
+  }
+
+  async addFileToProduct(fileId: string, productId: string) {
+    this.assertMediaId(fileId); this.assertProductId(productId);
+    const result = await this.graphql<{ fileUpdate: { files: Array<{ id: string }> | null; userErrors: Array<{ message: string }> } }>(`
+      mutation AddFileToProduct($files: [FileUpdateInput!]!) { fileUpdate(files: $files) { files { id } userErrors { message } } }
+    `, { files: [{ id: fileId, referencesToAdd: [productId] }] });
+    this.assertUserErrors(result.fileUpdate.userErrors);
+  }
+
+  async removeFileFromProduct(fileId: string, productId: string) {
+    this.assertMediaId(fileId); this.assertProductId(productId);
+    const result = await this.graphql<{ fileUpdate: { userErrors: Array<{ message: string }> } }>(`
+      mutation RemoveFileFromProduct($files: [FileUpdateInput!]!) { fileUpdate(files: $files) { files { id } userErrors { message } } }
+    `, { files: [{ id: fileId, referencesToRemove: [productId] }] });
+    this.assertUserErrors(result.fileUpdate.userErrors);
+  }
+
+  async appendVariantMedia(productId: string, mediaId: string, variantIds: string[]) {
+    this.assertProductId(productId); this.assertMediaId(mediaId); variantIds.forEach((id) => this.assertVariantId(id));
+    const result = await this.graphql<{ productVariantAppendMedia: { userErrors: Array<{ message: string }> } }>(`
+      mutation AppendVariantMedia($productId: ID!, $variantMedia: [ProductVariantAppendMediaInput!]!) {
+        productVariantAppendMedia(productId: $productId, variantMedia: $variantMedia) { userErrors { message } }
+      }
+    `, { productId, variantMedia: variantIds.map((variantId) => ({ variantId, mediaIds: [mediaId] })) });
+    this.assertUserErrors(result.productVariantAppendMedia.userErrors);
+  }
+
+  async detachVariantMedia(productId: string, mediaId: string, variantIds: string[]) {
+    this.assertProductId(productId); this.assertMediaId(mediaId); variantIds.forEach((id) => this.assertVariantId(id));
+    const result = await this.graphql<{ productVariantDetachMedia: { userErrors: Array<{ message: string }> } }>(`
+      mutation DetachVariantMedia($productId: ID!, $variantMedia: [ProductVariantDetachMediaInput!]!) {
+        productVariantDetachMedia(productId: $productId, variantMedia: $variantMedia) { userErrors { message } }
+      }
+    `, { productId, variantMedia: variantIds.map((variantId) => ({ variantId, mediaIds: [mediaId] })) });
+    this.assertUserErrors(result.productVariantDetachMedia.userErrors);
+  }
+
+  async reorderMedia(productId: string, mediaIds: string[]) {
+    this.assertProductId(productId); mediaIds.forEach((id) => this.assertMediaId(id));
+    const result = await this.graphql<{ productReorderMedia: { job: { id: string; done: boolean } | null; mediaUserErrors: Array<{ message: string }> } }>(`
+      mutation ReorderMedia($id: ID!, $moves: [MoveInput!]!) {
+        productReorderMedia(id: $id, moves: $moves) { job { id done } mediaUserErrors { message } }
+      }
+    `, { id: productId, moves: mediaIds.map((id, index) => ({ id, newPosition: String(index) })) });
+    this.assertUserErrors(result.productReorderMedia.mediaUserErrors);
+    if (result.productReorderMedia.job && !result.productReorderMedia.job.done) await this.waitForJob(result.productReorderMedia.job.id);
+  }
+
+  async deleteFile(fileId: string) {
+    this.assertMediaId(fileId);
+    const result = await this.graphql<{ fileDelete: { deletedFileIds: string[]; userErrors: Array<{ message: string }> } }>(`
+      mutation DeleteFile($fileIds: [ID!]!) { fileDelete(fileIds: $fileIds) { deletedFileIds userErrors { message } } }
+    `, { fileIds: [fileId] });
+    this.assertUserErrors(result.fileDelete.userErrors);
+    if (!result.fileDelete.deletedFileIds.includes(fileId)) throw new ShopifyError('Shopify did not confirm file deletion.', 502, 'FILE_DELETE_FAILED');
+  }
+
+  private async waitForJob(jobId: string) {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const data = await this.graphql<{ node: { done: boolean } | null }>(`query JobStatus($id: ID!) { node(id: $id) { ... on Job { done } } }`, { id: jobId });
+      if (data.node?.done) return;
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    throw new ShopifyError('Shopify asynchronous job timed out.', 504, 'JOB_TIMEOUT');
+  }
+
   private async accessToken(force = false) {
     if (!force && this.token && Date.now() < this.token.expiresAt - TOKEN_MARGIN_MS) return this.token.value;
     const response = await this.fetcher(`https://${this.config.shopDomain}/admin/oauth/access_token`, {
@@ -240,6 +379,21 @@ export class ShopifyService {
     return url;
   }
 
+  private validateStagedUrl(rawUrl: string) {
+    let url: URL;
+    try { url = new URL(rawUrl); } catch { throw new ShopifyError('Shopify returned an invalid staged upload URL.', 502, 'INVALID_STAGED_URL'); }
+    const host = url.hostname.toLowerCase();
+    const trusted = host.endsWith('.shopify.com') || host.endsWith('.shopifycdn.com') || host === 'storage.googleapis.com' || host.endsWith('.storage.googleapis.com') || host.endsWith('.googleapis.com');
+    if (url.protocol !== 'https:' || !trusted || url.username || url.password) throw new ShopifyError('Shopify returned an untrusted staged upload URL.', 502, 'INVALID_STAGED_URL');
+    return url;
+  }
+
+  private assertUserErrors(errors: Array<{ message: string }> | undefined) {
+    if (errors?.length) throw new ShopifyError(errors[0].message, 422, 'SHOPIFY_USER_ERROR');
+  }
+
   private assertProductId(id: string) { if (!PRODUCT_GID.test(id)) throw new ShopifyError('Invalid Shopify product ID.', 400, 'INVALID_ID'); }
+  private assertMediaId(id: string) { if (!/^gid:\/\/shopify\/MediaImage\/[1-9]\d*$/.test(id)) throw new ShopifyError('Invalid Shopify media ID.', 400, 'INVALID_ID'); }
+  private assertVariantId(id: string) { if (!/^gid:\/\/shopify\/ProductVariant\/[1-9]\d*$/.test(id)) throw new ShopifyError('Invalid Shopify variant ID.', 400, 'INVALID_ID'); }
   private mediaImage(media: MediaNode) { return media.mediaContentType === 'IMAGE' ? media.image ?? media.preview?.image ?? undefined : undefined; }
 }

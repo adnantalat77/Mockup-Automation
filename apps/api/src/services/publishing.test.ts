@@ -219,12 +219,32 @@ describe('PublishingService', () => {
     expect(api.createImageFile).toHaveBeenCalledOnce();
   });
 
-  it('safely resumes after the published-order mutation boundary fails', async () => {
+  it('reconciles an asynchronously completed reorder without repeating it', async () => {
     const { batch, publishing, api, live } = await fixture();
     api.reorderMedia.mockRejectedValueOnce(new Error('order job unavailable')).mockImplementation(async (_id: string, ids: string[]) => { live.mediaIds = [...ids]; });
     await expect(publishing.publish(batch.id)).resolves.toMatchObject({ status: 'partial' });
     await expect(publishing.publish(batch.id)).resolves.toMatchObject({ status: 'published' });
     expect(api.createImageFile).toHaveBeenCalledOnce();
+    expect(api.replaceVariantMedia).toHaveBeenCalledOnce();
+    expect(api.reorderMedia).toHaveBeenCalledOnce();
+  });
+
+  it('safely retries an interrupted reorder when live ordering has not completed', async () => {
+    const { batch, publishing, api, live } = await fixture();
+    api.reorderMedia.mockImplementationOnce(async () => { live.mediaIds = ['gid://shopify/MediaImage/99', 'gid://shopify/MediaImage/50']; throw new Error('job polling failed'); })
+      .mockImplementation(async (_id: string, ids: string[]) => { live.mediaIds = [...ids]; });
+    await expect(publishing.publish(batch.id)).resolves.toMatchObject({ status: 'partial', items: [{ intent: 'reorder_published' }] });
+    await expect(publishing.publish(batch.id)).resolves.toMatchObject({ status: 'published' });
+    expect(api.createImageFile).toHaveBeenCalledOnce(); expect(api.replaceVariantMedia).toHaveBeenCalledOnce(); expect(api.reorderMedia).toHaveBeenCalledTimes(2);
+  });
+
+  it('fails closed on unexpected media while reconciling interrupted reordering', async () => {
+    const { batch, publishing, api, live } = await fixture();
+    api.reorderMedia.mockRejectedValueOnce(new Error('job polling failed'));
+    await expect(publishing.publish(batch.id)).resolves.toMatchObject({ status: 'partial' });
+    live.mediaIds.push('gid://shopify/MediaImage/777');
+    await expect(publishing.publish(batch.id)).resolves.toMatchObject({ status: 'conflict' });
+    expect(api.reorderMedia).toHaveBeenCalledOnce(); expect(api.createImageFile).toHaveBeenCalledOnce(); expect(api.replaceVariantMedia).toHaveBeenCalledOnce();
   });
 
   it('rejects external variant-media changes before rollback', async () => {

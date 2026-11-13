@@ -76,6 +76,8 @@ Variant publishing uses `productVariantsBulkUpdate` with `mediaId` and `allowPar
 
 Published ordering is deterministic: all original media remain in their original order, followed by generated media in batch color order. The API verifies this ordering after Shopify's asynchronous reorder job. Checkpoints are written to uniquely named temporary files and atomically renamed; startup ignores temporary or malformed files and recovers the newest structurally valid checkpoint.
 
+`productReorderMedia` jobs are polled through Shopify's `job(id: ID!) { id done }` QueryRoot field. A missing job, GraphQL error, or failure to complete within 20 polls at 500 ms leaves the publication partial. Recovery first reconciles the complete live product state: an already-completed target order is checkpointed without another reorder, while a safe but unfinished order can retry only the idempotent reorder step. Created files and completed variant replacements are never repeated.
+
 ### Disposable Phase 4 test reset
 
 `Abandon Partial Operation` is hard-coded to the draft product `gid://shopify/Product/15608846975264` titled `Mockup Automation - TEST ONLY`. It is a metadata-only terminal action. Before enabling confirmation, the backend retrieves a complete live snapshot and requires exact equality with the operation's original product-media order, variant IDs, and variant-media associations, plus absence of every operation-created media ID from the product and variants. It never deletes Shopify Files. Each verified abandonment adds an immutable checkpoint containing the timestamp, reason, and verification evidence. Every nonterminal operation on the product must be individually abandoned or rolled back before a fresh publication is allowed.

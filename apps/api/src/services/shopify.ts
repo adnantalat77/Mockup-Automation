@@ -361,7 +361,9 @@ export class ShopifyService {
       }
     `, { id: productId, moves: mediaIds.map((id, index) => ({ id, newPosition: String(index) })) });
     this.assertUserErrors(result.productReorderMedia.mediaUserErrors);
-    if (result.productReorderMedia.job && !result.productReorderMedia.job.done) await this.waitForJob(result.productReorderMedia.job.id);
+    const job = result.productReorderMedia.job;
+    if (!job) throw new ShopifyError('Shopify did not return a media reorder job.', 502, 'REORDER_JOB_MISSING');
+    if (!job.done) await this.waitForJob(job.id);
   }
 
   async deleteFile(fileId: string) {
@@ -384,8 +386,9 @@ export class ShopifyService {
 
   private async waitForJob(jobId: string) {
     for (let attempt = 0; attempt < 20; attempt += 1) {
-      const data = await this.graphql<{ node: { done: boolean } | null }>(`query JobStatus($id: ID!) { node(id: $id) { ... on Job { done } } }`, { id: jobId });
-      if (data.node?.done) return;
+      const data = await this.graphql<{ job: { id: string; done: boolean } | null }>(`query JobStatus($id: ID!) { job(id: $id) { id done } }`, { id: jobId });
+      if (!data.job) throw new ShopifyError('Shopify asynchronous job could not be found.', 502, 'JOB_NOT_FOUND');
+      if (data.job.done) return;
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
     throw new ShopifyError('Shopify asynchronous job timed out.', 504, 'JOB_TIMEOUT');

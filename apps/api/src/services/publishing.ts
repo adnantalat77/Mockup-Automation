@@ -112,12 +112,14 @@ export class PublishingService {
       }
       if (operation!.items.every((item) => item.status === 'associated')) {
         const marker = operation!.items[0];
-        try {
-          if (marker) await this.intent(operation!, marker, 'reorder_published');
-          await this.shopify.reorderMedia(operation!.productId, operation!.expectedPublishedMediaOrder); if (marker) marker.intent = undefined;
-          operation!.completedSteps.push('published-order'); await this.checkpoint(operation!);
-        } catch (error) {
-          operation!.status = 'partial'; operation!.errors.push(error instanceof Error ? error.message : 'Published ordering failed.'); await this.checkpoint(operation!); return operation!;
+        if (!operation!.completedSteps.includes('published-order')) {
+          try {
+            if (marker) await this.intent(operation!, marker, 'reorder_published');
+            await this.shopify.reorderMedia(operation!.productId, operation!.expectedPublishedMediaOrder); if (marker) marker.intent = undefined;
+            operation!.completedSteps.push('published-order'); await this.checkpoint(operation!);
+          } catch (error) {
+            operation!.status = 'partial'; operation!.errors.push(error instanceof Error ? error.message : 'Published ordering failed.'); await this.checkpoint(operation!); return operation!;
+          }
         }
         const conflict = this.compareExpected(operation!, await this.shopify.getPublicationState(operation!.productId), 'published');
         if (conflict) return this.markConflict(operation!, `Published state verification failed: ${conflict}`);
@@ -240,6 +242,11 @@ export class PublishingService {
       if (onProduct && !operation.completedSteps.includes(STEP('product', item.color))) operation.completedSteps.push(STEP('product', item.color));
       if (associated && !operation.completedSteps.includes(STEP('variants', item.color))) operation.completedSteps.push(STEP('variants', item.color));
       if (associated) item.status = 'associated';
+    }
+    const reorderMarker = operation.items.find((item) => item.intent === 'reorder_published');
+    if (reorderMarker && same(live.mediaIds, operation.expectedPublishedMediaOrder)) {
+      reorderMarker.intent = undefined;
+      if (!operation.completedSteps.includes('published-order')) operation.completedSteps.push('published-order');
     }
     await this.checkpoint(operation); return undefined;
   }

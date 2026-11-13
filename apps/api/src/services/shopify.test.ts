@@ -124,6 +124,52 @@ describe('ShopifyService', () => {
     expect(body.variables.variants).toEqual(variantIds.map((id) => ({ id, mediaId: 'gid://shopify/MediaImage/99' })));
   });
 
+  it('polls productReorderMedia jobs through the supported QueryRoot job field until done', async () => {
+    vi.useFakeTimers();
+    try {
+      const jobId = 'gid://shopify/Job/11111111-1111-4111-8111-111111111111';
+      const fetcher = vi.fn().mockResolvedValueOnce(json({ access_token: 'token', expires_in: 3600 }))
+        .mockResolvedValueOnce(json({ data: { productReorderMedia: { job: { id: jobId, done: false }, mediaUserErrors: [] } } }))
+        .mockResolvedValueOnce(json({ data: { job: { id: jobId, done: false } } }))
+        .mockResolvedValueOnce(json({ data: { job: { id: jobId, done: true } } }));
+      const promise = new ShopifyService(config, fetcher as unknown as typeof fetch).reorderMedia('gid://shopify/Product/123', ['gid://shopify/MediaImage/1']);
+      await vi.runAllTimersAsync(); await expect(promise).resolves.toBeUndefined();
+      const pollDocuments = fetcher.mock.calls.slice(2).map((call) => JSON.parse(call[1].body).query as string);
+      expect(pollDocuments).toHaveLength(2); expect(pollDocuments.every((query) => query.includes('job(id: $id)'))).toBe(true);
+      expect(pollDocuments.every((query) => !query.includes('node(id:'))).toBe(true);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('does not poll when productReorderMedia reports an already completed job', async () => {
+    const fetcher = vi.fn().mockResolvedValueOnce(json({ access_token: 'token', expires_in: 3600 }))
+      .mockResolvedValueOnce(json({ data: { productReorderMedia: { job: { id: 'gid://shopify/Job/1', done: true }, mediaUserErrors: [] } } }));
+    await new ShopifyService(config, fetcher as unknown as typeof fetch).reorderMedia('gid://shopify/Product/123', ['gid://shopify/MediaImage/1']);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it('times out after the bounded number of pending job polls', async () => {
+    vi.useFakeTimers();
+    try {
+      const jobId = 'gid://shopify/Job/22222222-2222-4222-8222-222222222222';
+      const fetcher = vi.fn().mockResolvedValueOnce(json({ access_token: 'token', expires_in: 3600 }))
+        .mockResolvedValueOnce(json({ data: { productReorderMedia: { job: { id: jobId, done: false }, mediaUserErrors: [] } } }))
+        .mockImplementation(() => Promise.resolve(json({ data: { job: { id: jobId, done: false } } })));
+      const promise = new ShopifyService(config, fetcher as unknown as typeof fetch).reorderMedia('gid://shopify/Product/123', ['gid://shopify/MediaImage/1']);
+      const expectation = expect(promise).rejects.toMatchObject({ code: 'JOB_TIMEOUT' });
+      await vi.runAllTimersAsync(); await expectation;
+      expect(fetcher).toHaveBeenCalledTimes(22);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('propagates GraphQL errors returned while polling a reorder job', async () => {
+    const jobId = 'gid://shopify/Job/33333333-3333-4333-8333-333333333333';
+    const fetcher = vi.fn().mockResolvedValueOnce(json({ access_token: 'token', expires_in: 3600 }))
+      .mockResolvedValueOnce(json({ data: { productReorderMedia: { job: { id: jobId, done: false }, mediaUserErrors: [] } } }))
+      .mockResolvedValueOnce(json({ errors: [{ message: 'Job query failed' }] }));
+    await expect(new ShopifyService(config, fetcher as unknown as typeof fetch).reorderMedia('gid://shopify/Product/123', ['gid://shopify/MediaImage/1']))
+      .rejects.toMatchObject({ code: 'GRAPHQL_ERROR', message: 'Job query failed' });
+  });
+
   it('refreshes an expired token once after a 401', async () => {
     const fetcher = vi.fn()
       .mockResolvedValueOnce(json({ access_token: 'old', expires_in: 3600 }))

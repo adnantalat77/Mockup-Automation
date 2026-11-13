@@ -643,16 +643,17 @@ export class PublishingService {
       let parsed: unknown;
       try { parsed = JSON.parse(await readFile(path.join(directory, file), 'utf8')); }
       catch { continue; /* fall back from an incomplete or malformed write */ }
-      const legacy = parsed as Partial<PublicationOperation>;
-      if (legacy?.version === 1 && !Array.isArray(legacy.expectedPublishedMediaOrder) && Array.isArray(legacy.originalMediaOrder) && Array.isArray(legacy.items)) {
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new PublicationError(`Publication checkpoint integrity validation failed for ${file}: expected an operation object.`, 409);
+      const candidate = structuredClone(parsed) as Partial<PublicationOperation>;
+      const legacy = candidate;
+      if (legacy?.version === 1 && !Array.isArray(legacy.expectedPublishedMediaOrder) && Array.isArray(legacy.originalMediaOrder) && Array.isArray(legacy.items) && legacy.items.every((item) => item && typeof item === 'object')) {
         legacy.expectedPublishedMediaOrder = [...legacy.originalMediaOrder, ...legacy.items.map((item) => item.createdMediaId).filter((mediaId): mediaId is string => Boolean(mediaId))];
       }
-      if (structurallyValidOperation(parsed)) {
-        const integrityErrors = operationIntegrityErrors(parsed);
-        if (integrityErrors.length) throw new PublicationError(`Publication checkpoint integrity validation failed: ${integrityErrors.join(', ')}.`, 409);
-        if (parsed.id !== id) throw new PublicationError('Publication checkpoint identity does not match its directory.', 409);
-        return parsed;
-      }
+      if (!structurallyValidOperation(candidate)) throw new PublicationError(`Publication checkpoint integrity validation failed for ${file}: required fields or field types are invalid.`, 409);
+      const integrityErrors = operationIntegrityErrors(candidate);
+      if (integrityErrors.length) throw new PublicationError(`Publication checkpoint integrity validation failed for ${file}: ${integrityErrors.join(', ')}.`, 409);
+      if (candidate.id !== id) throw new PublicationError(`Publication checkpoint integrity validation failed for ${file}: operation ID does not match its directory.`, 409);
+      return candidate;
     }
     throw new PublicationError('No complete publication checkpoint was found.', 409);
   }

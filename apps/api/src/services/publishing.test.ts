@@ -757,6 +757,44 @@ describe('PublishingService', () => {
     expect(api.createImageFile).toHaveBeenCalledOnce();
   });
 
+  it.each([
+    ['missing required field', (checkpoint: any) => { delete checkpoint.productTitle; }, /required fields or field types/],
+    ['invalid operation version', (checkpoint: any) => { checkpoint.version = 2; }, /required fields or field types/],
+    ['invalid operation status', (checkpoint: any) => { checkpoint.status = 'successful'; }, /invalid operation status/],
+    ['wrong operation ID', (checkpoint: any) => { checkpoint.id = '22222222-2222-4222-8222-222222222222'; }, /operation ID does not match/],
+    ['contradictory variant ownership', (checkpoint: any) => { checkpoint.items.push({ ...structuredClone(checkpoint.items[0]), color: 'Navy' }); }, /duplicate item ownership/],
+    ['invalid field type', (checkpoint: any) => { checkpoint.items[0].variantIds = 'not-an-array'; }, /required fields or field types/],
+    ['Task 019 schema without provenance', (checkpoint: any) => { delete checkpoint.items[0].sourceProvenance; }, /incomplete source-integrity evidence/]
+  ])('fails closed without fallback, rewrite, or Shopify mutation for a complete checkpoint with %s', async (_name, mutate, diagnostic) => {
+    const { root, assets, batches, batch, api, publishing } = await fixture();
+    const operation = await publishing.publish(batch.id); const directory = path.join(root, 'publications', operation.id);
+    const before = (await readdir(directory)).filter((name) => /^\d{6}\.json$/.test(name)).length;
+    const invalid = structuredClone(operation); mutate(invalid);
+    await writeFile(path.join(directory, `${String(before).padStart(6, '0')}.json`), JSON.stringify(invalid));
+    vi.clearAllMocks();
+    const recovered = new PublishingService(root, assets, batches, api as any);
+    await expect(recovered.init()).rejects.toThrow(diagnostic);
+    expect(recovered.list()).toEqual([]);
+    expect((await readdir(directory)).filter((name) => /^\d{6}\.json$/.test(name))).toHaveLength(before + 1);
+    expect(api.stageImage).not.toHaveBeenCalled(); expect(api.createImageFile).not.toHaveBeenCalled(); expect(api.addFileToProduct).not.toHaveBeenCalled();
+    expect(api.replaceVariantMedia).not.toHaveBeenCalled(); expect(api.removeFileFromProduct).not.toHaveBeenCalled(); expect(api.reorderMedia).not.toHaveBeenCalled();
+  });
+
+  it('loads a valid historical checkpoint without Task 019 provenance and does not rewrite it', async () => {
+    const { root, assets, batches, batch, api, publishing } = await fixture();
+    const operation = await publishing.publish(batch.id); const directory = path.join(root, 'publications', operation.id);
+    const before = (await readdir(directory)).filter((name) => /^\d{6}\.json$/.test(name)).length;
+    const historical = structuredClone(operation);
+    delete historical.sourceValidationSchemaVersion;
+    for (const item of historical.items) { delete item.sourceProvenance; delete item.generationEvidence; }
+    await writeFile(path.join(directory, `${String(before).padStart(6, '0')}.json`), JSON.stringify(historical));
+    vi.clearAllMocks();
+    const recovered = new PublishingService(root, assets, batches, api as any); await recovered.init();
+    expect(recovered.get(operation.id)).toMatchObject({ id: operation.id, status: 'published' });
+    expect((await readdir(directory)).filter((name) => /^\d{6}\.json$/.test(name))).toHaveLength(before + 1);
+    expect(api.createImageFile).not.toHaveBeenCalled(); expect(api.replaceVariantMedia).not.toHaveBeenCalled();
+  });
+
   it('verifies and durably abandons a manually restored partial test operation', async () => {
     const { root, operation, publishing, api } = await restoredPartialFixture();
     const readiness = await publishing.validateAbandonment(operation.id);

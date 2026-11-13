@@ -98,7 +98,7 @@ Strong controls include byte-preserved sources, immutable original media/variant
 
 Remaining gaps:
 
-- **High:** JSON checkpoint locking and sequencing assume one API process. There is no cross-process lock or transactional database uniqueness constraint.
+- **Mitigated for the supported local Windows deployment (Task 020):** the executable API now atomically owns the canonical data directory through a process-lifetime Windows named-pipe handle before checkpoint recovery or other mutable initialization. The existing per-product lock still serializes operations within that owner. This is not a distributed lock and does not approve multiple machines, network-share deployments, or noncanonical filesystem aliases.
 - **Medium:** atomic rename prevents partial JSON visibility but no explicit file/directory `fsync` guarantees power-loss durability.
 - **Medium:** checkpoint validation is structural and shallow; there is no hash chain or signature protecting historical integrity.
 - **Medium:** rollback cannot locate a file created during the `fileCreate` response/checkpoint crash window because no media ID is known. It correctly stops for manual reconciliation.

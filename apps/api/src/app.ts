@@ -1,4 +1,6 @@
 import express from 'express';
+import { access } from 'node:fs/promises';
+import path from 'node:path';
 import crypto from 'node:crypto';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -33,12 +35,12 @@ export async function createApp(overrides: Partial<AppConfig> = {}) {
   const publishing = shopify && batches ? new PublishingService(config.dataDir, store, batches, shopify, config.publishingProductIds) : undefined;
   if (publishing) await publishing.init();
   const app = express();
-  app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
+  app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' }, contentSecurityPolicy: { directives: { imgSrc: ["'self'", 'data:', 'https://cdn.shopify.com'] } } }));
   app.use(cors({ origin: config.webOrigin }));
   app.use(express.json({ limit: '64kb' }));
   const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: config.maxUploadBytes, files: 1 } });
 
-  app.get('/api/health', (_request, response) => response.json({ status: 'ok', phase: 4 }));
+  app.get('/api/health', (_request, response) => response.json({ status: 'ok', application: 'mockup-automation', phase: 4 }));
 
   app.get('/api/shopify/status', async (_request, response) => {
     if (!shopify) return response.json({ configured: false, connected: false, scopes: [], error: shopifySetupError });
@@ -279,6 +281,14 @@ export async function createApp(overrides: Partial<AppConfig> = {}) {
       response.type(asset.filename.endsWith('.jpg') ? 'image/jpeg' : 'image/png').send(buffer);
     } catch (error) { next(error); }
   });
+
+  if (config.webDistDir) {
+    const indexPath = path.join(config.webDistDir, 'index.html');
+    try { await access(indexPath); }
+    catch { throw new Error(`Production frontend build is missing at ${indexPath}. Run npm run build before launching.`); }
+    app.use(express.static(config.webDistDir, { fallthrough: true, index: false }));
+    app.get('*', (request, response, next) => request.path.startsWith('/api/') ? next() : response.sendFile(indexPath));
+  }
 
   app.use((error: any, _request: express.Request, response: express.Response, _next: express.NextFunction) => {
     void _next;

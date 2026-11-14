@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, readdir } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import sharp from 'sharp';
@@ -156,5 +156,21 @@ describe('publishing authorization', () => {
     expect((await request(app).get('/api/publishing/restoration/status').set('X-Publish-Authorization', 'not-authorized')).status).toBe(403);
     expect((await request(app).post('/api/publishing/restoration/validate').set(headers).send({})).status).toBe(403);
     expect((await request(app).post('/api/publishing/restoration/clear').set(headers).send({ confirm: 'CLEAR RESTORATION invalid' })).status).toBe(403);
+  });
+});
+
+describe('production frontend serving', () => {
+  it('serves the built dashboard and client routes while preserving API health', async () => {
+    const webDistDir = await mkdtemp(path.join(tmpdir(), 'mockup-web-dist-'));
+    await writeFile(path.join(webDistDir, 'index.html'), '<!doctype html><title>Mockup Automation production</title>');
+    const productionApp = await createApp({ dataDir: await mkdtemp(path.join(tmpdir(), 'mockup-production-data-')), maxUploadBytes: 1024 * 1024, webDistDir });
+    expect((await request(productionApp).get('/')).text).toContain('Mockup Automation production');
+    expect((await request(productionApp).get('/publication-history')).text).toContain('Mockup Automation production');
+    await expect(request(productionApp).get('/api/health')).resolves.toMatchObject({ status: 200, body: { status: 'ok' } });
+    expect((await request(productionApp).get('/api/not-a-route')).status).toBe(404);
+  });
+
+  it('fails startup when the configured production frontend build is missing', async () => {
+    await expect(createApp({ dataDir: await mkdtemp(path.join(tmpdir(), 'mockup-production-data-')), webDistDir: path.join(tmpdir(), 'missing-web-build') })).rejects.toThrow(/Production frontend build is missing/);
   });
 });

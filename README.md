@@ -39,6 +39,12 @@ npm run lint
 
 These commands are root scripts backed by npm workspaces. `npm test` runs API image/upload tests; `npm run build` builds shared types, API, and web production assets.
 
+## Windows Release 1 launcher
+
+After the one-time installation (`npm install`, `.env` configuration, and `npm run build`), normal operation does not use Vite or require an npm command. Double-click `Start-Mockup-Automation.cmd` in the repository root, or run `scripts\windows\Install-DesktopShortcut.ps1` once to create **Mockup Automation** on the desktop. The launcher validates Node.js 20.19+, the production build, dependencies, explicit persistent `DATA_DIR`, Shopify configuration, disabled-by-default publishing gates, exact product allowlist, and the production loopback origin. It starts the compiled API hidden, serves the built dashboard at <http://127.0.0.1:3001>, retains logs under ignored `logs/`, and opens the default browser. A running healthy instance is reused rather than duplicated.
+
+Closing the browser does not stop the API or interrupt work. Double-click `Stop-Mockup-Automation.cmd` to request token-protected graceful shutdown. The API stops accepting requests, waits for active requests, and releases its data-directory lock only after HTTP shutdown succeeds. The stop command never force-kills a failed shutdown. See [docs/RELEASE1_WINDOWS_OPERATOR_GUIDE.md](docs/RELEASE1_WINDOWS_OPERATOR_GUIDE.md).
+
 ## Local workflow
 
 1. Connect Shopify and select a product through the read-only catalog search.

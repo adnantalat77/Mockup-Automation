@@ -1,8 +1,9 @@
 import { config as loadEnvironment } from 'dotenv';
 import { appendFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import path from 'node:path';
 import { startApi } from './runtime.js';
-import { installShutdownRoute } from './runtime-control.js';
+import { installRuntimeControl } from './runtime-control.js';
 
 loadEnvironment({ path: fileURLToPath(new URL('../../../.env', import.meta.url)), quiet: true });
 
@@ -30,7 +31,11 @@ try {
     });
     return shutdownAttempt;
   };
-  installShutdownRoute(runtime.app, process.env.MOCKUP_SHUTDOWN_TOKEN, async () => { await shutdown(); process.exitCode = 0; });
+  const instanceToken = process.env.MOCKUP_INSTANCE_TOKEN; const shutdownToken = process.env.MOCKUP_SHUTDOWN_TOKEN; const startupId = process.env.MOCKUP_STARTUP_ID;
+  installRuntimeControl(runtime.app, instanceToken && shutdownToken && startupId ? {
+    instanceToken, shutdownToken, startupId, pid: process.pid,
+    appRoot: path.resolve(fileURLToPath(new URL('../../../', import.meta.url))), dataDir: runtime.lock.canonicalDataDir
+  } : undefined, async () => { await shutdown(); process.exitCode = 0; });
   process.on('SIGINT', () => void shutdown());
   process.on('SIGTERM', () => void shutdown());
 } catch (error) {

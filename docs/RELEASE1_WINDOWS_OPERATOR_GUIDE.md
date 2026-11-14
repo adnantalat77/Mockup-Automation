@@ -6,7 +6,7 @@
 2. Open PowerShell in the application folder once and run `npm install` followed by `npm run build`.
 3. Copy `.env.example` to `.env`. Never commit or share `.env`.
 4. Set the exact `SHOPIFY_SHOP_DOMAIN`, client ID, client secret, API version, `DATA_DIR`, and `WEB_ORIGIN=http://127.0.0.1:3001`.
-5. Leave publishing disabled until the app scopes and operator process are approved. For an authorized publishing workstation, explicitly set `SHOPIFY_PUBLISHING_ENABLED=true`, a random authorization token of at least 32 characters, and only the exact approved Product GIDs in `SHOPIFY_PUBLISH_PRODUCT_IDS`.
+5. Leave `SHOPIFY_PUBLISHING_ENABLED=false` until the app scopes and operator process are approved. Read-only startup does not require `SHOPIFY_PUBLISHING_AUTH_TOKEN` or `SHOPIFY_PUBLISH_PRODUCT_IDS`; both may remain empty and all publishing endpoints stay disabled. For an authorized publishing workstation, set the flag exactly to `true`, provide a random authorization token of at least 32 characters, and list only exact approved Product GIDs. Values such as `yes`, `1`, and `enabled` are rejected rather than interpreted.
 6. Release the Shopify app with `read_products`, `write_products`, and `write_files`. Do not request unrelated scopes.
 7. Optionally create the desktop shortcut:
 
@@ -19,7 +19,7 @@ The exact daily launcher is `Start-Mockup-Automation.cmd` in the repository root
 ## Daily use
 
 1. Double-click **Mockup Automation** on the desktop or `Start-Mockup-Automation.cmd`.
-2. The launcher validates configuration, dependencies, the production build, and persistent data path. It starts one hidden API instance and opens <http://127.0.0.1:3001>. If it reports an error, correct that error before retrying; do not start a second copy.
+2. The launcher validates configuration, dependencies, the production build, and persistent data path. It starts one hidden API instance and opens <http://127.0.0.1:3001>. An existing instance is accepted only after its private identity challenge proves the recorded process, startup, installation, and canonical data directory. If ownership is missing, corrupt, stale-but-live, mismatched, or unverifiable, preserve the runtime record, correct the reported condition, and do not start or kill another process.
 3. Confirm Shopify shows **Connected** and review the granted scopes.
 4. Search for and select the intended product. Confirm its title, Product GID, colors, nine-or-other expected variants, source transparency, and mapping warnings.
 5. Upload the approved background and select **Generate All Mockups**.
@@ -57,7 +57,7 @@ A restore writes a marker and blocks every publication transition. Use the dashb
 - A missing runtime message requires Node.js 20.19+.
 - A missing build message requires `npm run build` during maintenance.
 - A missing configuration message names the required `.env` keys without printing their values.
-- A duplicate-instance message means another process owns the same canonical data directory. Open the existing dashboard or stop it gracefully.
+- A concurrent-launch message means another launcher is still verifying startup. Retry after it finishes. An authenticated existing instance opens normally; a missing/corrupt runtime record, PID mismatch, path mismatch, fake service, or failed identity challenge is intentionally not trusted or killed.
 - Shopify disconnected or missing-scope messages require correcting the server-side app configuration; credentials never belong in the browser.
 - Partial publication, uncertain file creation, external Shopify drift, restore journals, and corrupted checkpoints fail closed. Preserve all files and use the displayed recovery procedure.
 

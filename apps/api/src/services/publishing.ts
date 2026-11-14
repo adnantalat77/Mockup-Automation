@@ -19,6 +19,7 @@ const OPERATION_STATUSES = new Set(['validated', 'publishing', 'published', 'par
 const ITEM_STATUSES = new Set(['pending', 'uploaded', 'associated', 'failed', 'rolled_back']);
 const ITEM_INTENTS = new Set(['stage_upload', 'create_file', 'add_product_reference', 'append_variants', 'replace_variants', 'remove_original_reference', 'restore_original_reference', 'restore_variants', 'reorder_published', 'detach_variants', 'remove_product_reference', 'delete_file', 'restore_order']);
 type PublishingShopify = Pick<ShopifyService, 'getProduct' | 'getPublicationState' | 'downloadImage' | 'stageImage' | 'createImageFile' | 'waitForFileReady' | 'addFileToProduct' | 'removeFileFromProduct' | 'replaceVariantMedia' | 'detachVariantMedia' | 'reorderMedia'>;
+type PlannedColor = { color: string; variantIds: string[]; previewId: string; sourceMediaId: string };
 
 export class PublicationError extends Error { constructor(message: string, readonly status = 400) { super(message); } }
 export class PublicationPersistenceError extends Error { constructor(message: string, readonly cause?: unknown) { super(message); this.name = 'PublicationPersistenceError'; } }
@@ -290,7 +291,7 @@ export class PublishingService {
       try { batch = await this.batches.get(batchId); } catch { errors.push('The operation batch metadata is unavailable.'); }
       if (batch && batch.productId !== operation.productId) errors.push('The batch product does not match the immutable publication operation.');
       if (batch && operation.sourceValidationSchemaVersion === 1) {
-        const context = await this.preflight(batchId); errors.push(...context.errors.map((error) => `Recovery source validation: ${error}`));
+        const context = await this.preflight(batchId, operation.originalMediaOrder); errors.push(...context.errors.map((error) => `Recovery source validation: ${error}`));
         errors.push(...this.recoverySourceErrors(operation, context.batch, context.colors));
       }
     }
@@ -330,7 +331,7 @@ export class PublishingService {
         operation = this.get(operation.id);
         if (operation.status !== 'partial') throw new PublicationError(`Operation ${operation.id} is no longer eligible for recovery.`, 409);
         if (operation.sourceValidationSchemaVersion === 1) {
-          const context = await this.preflight(operation.batchId);
+          const context = await this.preflight(operation.batchId, operation.originalMediaOrder);
           const sourceErrors = [...context.errors, ...this.recoverySourceErrors(operation, context.batch, context.colors)];
           if (sourceErrors.length) throw new PublicationError(`Recovery source validation failed: ${sourceErrors.join(' ')}`, 409);
         }
@@ -694,7 +695,7 @@ export class PublishingService {
     return undefined;
   }
 
-  private async preflight(batchId: string) {
+  private async preflight(batchId: string, originalMediaOrder?: string[]) {
     const errors: string[] = []; let batch: MockupBatch; try { batch = await this.batches.get(batchId); } catch { throw new PublicationError('Batch not found.', 404); }
     if (batch.status !== 'completed') errors.push('The selected batch must be fully completed with no failed or skipped colors.');
     const [product, state] = await Promise.all([this.shopify.getProduct(batch.productId, false), this.shopify.getPublicationState(batch.productId)]);
@@ -704,7 +705,7 @@ export class PublishingService {
     const disposableTestProduct = product.id === ABANDONMENT_TEST_PRODUCT_ID && product.title === ABANDONMENT_TEST_PRODUCT_TITLE && product.status.toUpperCase() === 'DRAFT';
     if (!disposableTestProduct && !this.allowedProductIds.has(product.id)) errors.push('This Shopify product is not approved by the server-side publishing allowlist.');
     if (product.id !== batch.productId || product.title !== batch.productTitle) errors.push('The live Shopify product identity does not match the completed batch.');
-    const colors: Array<{ color: string; variantIds: string[]; previewId: string }> = [];
+    const colors: PlannedColor[] = [];
     const sourceFreshness: NonNullable<PublishReadiness['sourceFreshness']> = [];
     for (const item of batch.items) {
       if (item.status !== 'success' || !item.preview || !item.sourceImageId) { errors.push(`${item.color}: generated preview or reliable source mapping is missing.`); sourceFreshness.push({ color: item.color, state: item.sourceFreshness?.state ?? 'provenance_missing', reason: item.reason ?? 'Generated preview or source mapping is missing.' }); continue; }
@@ -735,7 +736,7 @@ export class PublishingService {
         if (this.hash(currentBytes) !== provenance.sha256) { const reason = 'Current Shopify source artwork changed after batch generation.'; errors.push(`${item.color}: ${reason.toLowerCase()}`); sourceFreshness.push({ color: item.color, state: 'source_changed', reason }); continue; }
       } catch (error) { const reason = `Current Shopify source is unavailable or invalid${error instanceof Error ? `: ${error.message}` : '.'}`; errors.push(`${item.color}: ${reason.toLowerCase()}`); sourceFreshness.push({ color: item.color, state: 'source_unavailable', reason }); continue; }
       sourceFreshness.push({ color: item.color, state: 'verified_current', reason: 'Current Shopify source bytes and variant associations match the generated batch provenance.' });
-      colors.push({ color: item.color, variantIds: variants.map((v) => v.id), previewId: item.preview.id });
+      colors.push({ color: item.color, variantIds: variants.map((v) => v.id), previewId: item.preview.id, sourceMediaId: provenance.mediaId });
     }
     const uniqueProductColors = new Set(product.variants.map((variant) => variant.color).filter((color): color is string => Boolean(color)));
     const batchColors = new Set(colors.map((item) => item.color));
@@ -746,12 +747,22 @@ export class PublishingService {
     const mappedVariantIds = colors.flatMap((item) => item.variantIds);
     if (mappedVariantIds.length !== product.variants.length || new Set(mappedVariantIds).size !== mappedVariantIds.length || product.variants.some((variant) => !mappedVariantIds.includes(variant.id))) errors.push('Every Shopify variant must map exactly once to its generated color image.');
     if (colors.some((item) => item.variantIds.length > 250)) errors.push('A color exceeds Shopify’s 250-item mutation input limit.');
-    return { batch, state, errors, colors, sourceFreshness };
+    const canonicalSourceMediaOrder = originalMediaOrder ?? state.mediaIds;
+    const colorsBySourceMedia = new Map<string, PlannedColor>();
+    for (const item of colors) {
+      if (colorsBySourceMedia.has(item.sourceMediaId)) errors.push(`Source media ${item.sourceMediaId} is mapped to more than one generated color.`);
+      else colorsBySourceMedia.set(item.sourceMediaId, item);
+      if (!canonicalSourceMediaOrder.includes(item.sourceMediaId)) errors.push(`${item.color}: provenance source media is not present in the verified original Shopify gallery.`);
+    }
+    for (const mediaId of canonicalSourceMediaOrder) if (!colorsBySourceMedia.has(mediaId)) errors.push(`Original gallery media ${mediaId} has no uniquely validated generated color mapping.`);
+    const orderedColors = canonicalSourceMediaOrder.map((mediaId) => colorsBySourceMedia.get(mediaId)).filter((item): item is PlannedColor => Boolean(item));
+    if (orderedColors.length !== colors.length || orderedColors.length !== canonicalSourceMediaOrder.length) errors.push('The generated gallery plan does not map one-to-one to the verified original Shopify gallery order.');
+    return { batch, state, errors, colors: orderedColors, sourceFreshness };
   }
 
   private hash(buffer: Buffer) { return crypto.createHash('sha256').update(buffer).digest('hex'); }
 
-  private recoverySourceErrors(operation: PublicationOperation, batch: MockupBatch, colors: Array<{ color: string; variantIds: string[]; previewId: string }>) {
+  private recoverySourceErrors(operation: PublicationOperation, batch: MockupBatch, colors: PlannedColor[]) {
     const errors: string[] = [];
     for (const operationItem of operation.items) {
       const batchItem = batch.items.find((item) => item.color === operationItem.color); const current = colors.find((item) => item.color === operationItem.color);

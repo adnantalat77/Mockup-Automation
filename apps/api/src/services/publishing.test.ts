@@ -27,6 +27,25 @@ const releaseOneProduct: ShopifyProductDetail = {
   })))
 };
 
+const acceptanceGalleryColors = ['Solid White Blend', 'Soft Cream', 'Yellow', 'Heather Dust', 'Heather Prism Ice Blue', 'Heather Mint', 'Silver', 'Ash', 'Natural', 'Vintage White', 'Heather Ice Blue'];
+const acceptanceBatchColors = [...acceptanceGalleryColors.slice(1), acceptanceGalleryColors[0]];
+const acceptanceImages = acceptanceGalleryColors.map((color, index) => ({
+  id: `gid://shopify/ProductImage/${800 + index}`, mediaId: `gid://shopify/MediaImage/${800 + index}`,
+  url: `https://cdn.shopify.com/acceptance-${index}.png`, associatedColors: [color], association: 'reliable' as const, validation: 'transparent' as const
+}));
+const acceptanceProduct: ShopifyProductDetail = {
+  id: 'gid://shopify/Product/777', title: 'Release 1 Acceptance Draft', handle: 'release-1-acceptance-draft', status: 'DRAFT',
+  colors: acceptanceBatchColors, sizes: ['S', 'M', 'L', 'XL', '2XL', '3XL'], images: acceptanceImages,
+  variants: acceptanceBatchColors.flatMap((color, colorIndex) => {
+    const sizes = color === 'Vintage White' ? ['S', 'M', 'L', 'XL', '2XL'] : ['S', 'M', 'L', 'XL', '2XL', '3XL'];
+    const image = acceptanceImages.find((candidate) => candidate.associatedColors[0] === color)!;
+    return sizes.map((size, sizeIndex) => ({
+      id: `gid://shopify/ProductVariant/${8000 + colorIndex * 6 + sizeIndex}`, title: `${color} / ${size}`, color, size,
+      selectedOptions: [{ name: 'Color', value: color }, { name: 'Size', value: size }], associatedImageIds: [image.id]
+    }));
+  })
+};
+
 const largeColors = ['Black', 'Navy', 'White', 'Red', 'Green', 'Blue', 'Gray', 'Gold'];
 const largeProduct: ShopifyProductDetail = {
   id: 'gid://shopify/Product/999', title: 'Allowlisted Production Shirt', handle: 'allowlisted-shirt', status: 'ACTIVE', colors: largeColors,
@@ -53,7 +72,7 @@ async function fixture(overrides: Record<string, unknown> = {}, selectedProduct:
   const reader = { getProduct: vi.fn().mockResolvedValue(selectedProduct), downloadImage: vi.fn().mockImplementation(downloadSource) };
   const batches = new BatchService(root, assets, reader as any); await batches.init();
   const batch = await waitBatch(batches, (await batches.create(selectedProduct.id, background.id)).id);
-  const originalMediaIds = selectedProduct.images.map((entry, index) => entry.id.startsWith('gid://shopify/MediaImage/') ? entry.id : `gid://shopify/MediaImage/${50 + index}`);
+  const originalMediaIds = selectedProduct.images.map((entry, index) => entry.mediaId ?? (entry.id.startsWith('gid://shopify/MediaImage/') ? entry.id : `gid://shopify/MediaImage/${50 + index}`));
   const mediaByImageId = new Map(selectedProduct.images.map((entry, index) => [entry.id, originalMediaIds[index]]));
   const live = { complete: true as const, mediaIds: [...originalMediaIds], variants: selectedProduct.variants.map((variant) => ({ id: variant.id, color: variant.color, mediaIds: [mediaByImageId.get(variant.associatedImageIds[0]) ?? originalMediaIds[0]] })) };
   let createdIndex = 0;
@@ -297,6 +316,51 @@ describe('PublishingService', () => {
     expect(base.api.createImageFile).toHaveBeenCalledTimes(3);
   });
 
+  it('plans and publishes eleven images in verified original gallery order while retaining all 65 variant mappings', async () => {
+    const base = await fixture({}, acceptanceProduct, [acceptanceProduct.id]);
+    expect(base.batch.items.map((item) => item.color)).toEqual(acceptanceBatchColors);
+    const readiness = await base.publishing.validate(base.batch.id);
+    expect(readiness).toMatchObject({ ready: true, imageCount: 11, variantCount: 65 });
+    expect(readiness.colors.map((item) => item.color)).toEqual(acceptanceGalleryColors);
+    const operation = await base.publishing.publish(base.batch.id, `PUBLISH ${acceptanceProduct.id}`);
+    expect(operation.items.map((item) => item.color)).toEqual(acceptanceGalleryColors);
+    expect(operation.originalMediaOrder).toEqual(acceptanceImages.map((image) => image.mediaId));
+    expect(operation.expectedPublishedMediaOrder).toHaveLength(11);
+    expect(new Set(operation.items.flatMap((item) => item.variantIds)).size).toBe(65);
+    for (const item of operation.items) {
+      const expectedVariants = acceptanceProduct.variants.filter((variant) => variant.color === item.color).map((variant) => variant.id);
+      expect(item.variantIds).toEqual(expectedVariants);
+      for (const variantId of item.variantIds) expect(base.live.variants.find((variant) => variant.id === variantId)?.mediaIds).toEqual([item.createdMediaId]);
+    }
+    expect(base.live.mediaIds).toEqual(operation.expectedPublishedMediaOrder);
+  });
+
+  it('derives the same canonical plan after randomized batch-item ordering', async () => {
+    const base = await fixture({}, acceptanceProduct, [acceptanceProduct.id]);
+    base.batch.items = [base.batch.items[4], base.batch.items[0], base.batch.items[9], base.batch.items[2], base.batch.items[7], base.batch.items[10], base.batch.items[1], base.batch.items[6], base.batch.items[3], base.batch.items[8], base.batch.items[5]];
+    expect(base.batch.items.map((item) => item.color)).not.toEqual(acceptanceGalleryColors);
+    const readiness = await base.publishing.validate(base.batch.id);
+    expect(readiness.ready).toBe(true);
+    expect(readiness.colors.map((item) => item.color)).toEqual(acceptanceGalleryColors);
+  });
+
+  it.each([
+    ['duplicate', 'gid://shopify/MediaImage/700', /more than one generated color|one-to-one/i],
+    ['unknown', 'gid://shopify/MediaImage/999', /not present in the verified original Shopify gallery|one-to-one/i]
+  ])('fails closed for %s source-media provenance identities', async (kind, mediaId, diagnostic) => {
+    const base = await fixture({}, releaseOneProduct, [releaseOneProduct.id]);
+    const item = base.batch.items[1];
+    item.sourceProvenance!.mediaId = mediaId;
+    item.sourceAsset!.provenance!.mediaId = mediaId;
+    const current = structuredClone(releaseOneProduct);
+    current.images[1].mediaId = mediaId;
+    base.api.getProduct.mockResolvedValue(current);
+    const readiness = await base.publishing.validate(base.batch.id);
+    expect(readiness.ready).toBe(false);
+    expect(readiness.errors.join(' ')).toMatch(diagnostic);
+    expect(base.api.stageImage).not.toHaveBeenCalled();
+  });
+
   it('revalidates a matching current source hash during final publication preflight', async () => {
     const { batch, publishing, api } = await fixture();
     await expect(publishing.validate(batch.id)).resolves.toMatchObject({ ready: true });
@@ -394,7 +458,7 @@ describe('PublishingService', () => {
     const first = await publishing.publish(batch.id);
     const firstCheckpointCount = (await readdir(path.join(root, 'publications', first.id))).filter((name) => name.endsWith('.json')).length;
     const secondBatch = await waitBatch(batches, (await batches.create(product.id, background.id)).id);
-    await expect(publishing.validate(secondBatch.id)).resolves.toMatchObject({ ready: false, errors: [expect.stringMatching(/already processed/)] });
+    await expect(publishing.validate(secondBatch.id)).resolves.toMatchObject({ ready: false, errors: expect.arrayContaining([expect.stringMatching(/already processed/)]) });
     await expect(publishing.publish(secondBatch.id)).rejects.toMatchObject({ status: 409 });
     expect(live.mediaIds).toEqual(['gid://shopify/MediaImage/99']);
     await expect(publishing.rollback(first.id, 'no_global_delete')).resolves.toMatchObject({ status: 'conflict', productRestored: true });

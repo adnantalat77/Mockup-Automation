@@ -258,3 +258,28 @@ export interface RecoveryReadiness {
   orderingComplete: boolean;
   errors: string[];
 }
+
+export type RestorationReconciliationOutcome = 'exactly_published' | 'exactly_rolled_back' | 'rolled_back_files_retained' | 'abandoned';
+
+export interface RestorationProductReconciliation {
+  productId: string;
+  operationIds: string[];
+  controllingOperationId: string;
+  outcome?: RestorationReconciliationOutcome;
+  mediaIds: string[];
+  variantAssociations: Array<{ variantId: string; mediaIds: string[] }>;
+  errors: string[];
+}
+
+export interface RestorationReconciliation {
+  pending: boolean;
+  eligible: boolean;
+  markerFingerprint?: string;
+  confirmationText?: string;
+  stateDigest?: string;
+  verifiedAt?: string;
+  products: RestorationProductReconciliation[];
+  errors: string[];
+  alreadyCleared?: boolean;
+  evidencePath?: string;
+}

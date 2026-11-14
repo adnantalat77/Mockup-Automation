@@ -130,7 +130,11 @@ export async function createApp(overrides: Partial<AppConfig> = {}) {
     if (!config.publishingEnabled) return response.json({ enabled: false, reason: 'Publishing is disabled by the server feature flag.' });
     if (!publishing) return response.json({ enabled: false, reason: 'Shopify is not configured.' });
     if (!config.publishingAuthToken || config.publishingAuthToken.length < 32) return response.json({ enabled: false, reason: 'Publishing authorization is not configured securely.' });
-    try { await verifyPublishingScopes(); return response.json({ enabled: true }); }
+    try {
+      const restoration = await publishing.restorationStatus();
+      if (restoration.pending) return response.json({ enabled: false, restorationPending: true, reason: 'Restored data is mutation-blocked until an authorized operator completes exact, read-only Shopify reconciliation and explicit marker clearance.' });
+      await verifyPublishingScopes(); return response.json({ enabled: true });
+    }
     catch (error) { return response.json({ enabled: false, reason: error instanceof Error ? error.message : 'Publishing scope verification failed.' }); }
   });
 
@@ -143,6 +147,21 @@ export async function createApp(overrides: Partial<AppConfig> = {}) {
     const expected = Buffer.from(config.publishingAuthToken); const actual = Buffer.from(supplied);
     if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) throw new PublicationError('Publishing authorization failed.', 401);
   };
+
+  app.get('/api/publishing/restoration/status', async (request, response, next) => {
+    try { authorizePublishing(request, false); response.json(await publishing!.restorationStatus()); }
+    catch (error) { next(error); }
+  });
+
+  app.post('/api/publishing/restoration/validate', async (request, response, next) => {
+    try { authorizePublishing(request); await verifyPublishingScopes(); response.json(await publishing!.validateRestoration()); }
+    catch (error) { next(error); }
+  });
+
+  app.post('/api/publishing/restoration/clear', async (request, response, next) => {
+    try { authorizePublishing(request); await verifyPublishingScopes(); response.json(await publishing!.clearRestoration(String(request.body?.confirm ?? ''))); }
+    catch (error) { next(error); }
+  });
 
   app.post('/api/publishing/validate', async (request, response, next) => {
     try { authorizePublishing(request); await verifyPublishingScopes(); response.json(await publishing!.validate(String(request.body?.batchId ?? ''))); }

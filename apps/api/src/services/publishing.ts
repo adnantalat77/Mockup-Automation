@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
-import { access, mkdir, readFile, readdir } from 'node:fs/promises';
+import { access, mkdir, readFile, readdir, rename } from 'node:fs/promises';
 import path from 'node:path';
-import type { AbandonReadiness, AbandonmentEvidence, MockupBatch, PublicationItem, PublicationOperation, PublishReadiness, RecoveryReadiness, RollbackFinalizationEvidence, RollbackFinalizationReadiness, RollbackMode } from '@mockup-automation/shared';
+import type { AbandonReadiness, AbandonmentEvidence, MockupBatch, PublicationItem, PublicationOperation, PublishReadiness, RecoveryReadiness, RestorationProductReconciliation, RestorationReconciliation, RestorationReconciliationOutcome, RollbackFinalizationEvidence, RollbackFinalizationReadiness, RollbackMode } from '@mockup-automation/shared';
 import { analyzeTransparency, inspectImage } from './images.js';
 import { AssetStore } from './storage.js';
 import { BatchService } from './batches.js';
@@ -14,6 +14,7 @@ const STEP = (kind: string, color: string) => `${kind}:${color}`;
 export const ABANDONMENT_TEST_PRODUCT_ID = 'gid://shopify/Product/15608846975264';
 const ABANDONMENT_TEST_PRODUCT_TITLE = 'Mockup Automation - TEST ONLY';
 const NONBLOCKING_STATUSES = new Set(['published', 'rolled_back', 'rolled_back_files_retained', 'abandoned']);
+const COMPLETED_RELEASE_ONE_STATUSES = new Set(['published', 'rolled_back', 'rolled_back_files_retained']);
 const OPERATION_STATUSES = new Set(['validated', 'publishing', 'published', 'partial', 'rolling_back', 'rolled_back', 'rolled_back_files_retained', 'rollback_partial', 'conflict', 'abandoned']);
 const ITEM_STATUSES = new Set(['pending', 'uploaded', 'associated', 'failed', 'rolled_back']);
 const ITEM_INTENTS = new Set(['stage_upload', 'create_file', 'add_product_reference', 'append_variants', 'replace_variants', 'remove_original_reference', 'restore_original_reference', 'restore_variants', 'reorder_published', 'detach_variants', 'remove_product_reference', 'delete_file', 'restore_order']);
@@ -108,10 +109,13 @@ export class PublishingService {
   private readonly locks = new Set<string>();
   private readonly persistenceBlockedProducts = new Set<string>();
   private readonly restorationMarker: string;
+  private readonly restorationEvidenceFolder: string;
+  private restorationReconciliationRunning = false;
   private readonly allowedProductIds: Set<string>;
   constructor(dataDir: string, private readonly assets: AssetStore, private readonly batches: BatchService, private readonly shopify: PublishingShopify, allowedProductIds: string[] = [], private readonly checkpointWriter: AtomicWriter = atomicWriteFile) {
     this.folder = path.join(dataDir, 'publications');
     this.restorationMarker = path.join(dataDir, 'RESTORED_FROM_BACKUP.json');
+    this.restorationEvidenceFolder = path.join(dataDir, 'restoration-reconciliations');
     if (allowedProductIds.some((id) => !PRODUCT_GID.test(id))) throw new PublicationError('SHOPIFY_PUBLISH_PRODUCT_IDS contains an invalid Shopify Product GID.', 500);
     this.allowedProductIds = new Set(allowedProductIds);
   }
@@ -139,12 +143,112 @@ export class PublishingService {
   }
   list() { return [...this.records.values()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)); }
   get(id: string) { this.assertId(id); const operation = this.records.get(id); if (!operation) throw new PublicationError('Publication operation not found.', 404); return operation; }
+
+  async restorationStatus(): Promise<RestorationReconciliation> {
+    try {
+      const marker = await readFile(this.restorationMarker);
+      let parsed: unknown;
+      try { parsed = JSON.parse(marker.toString('utf8')); } catch { throw new PublicationError('The restoration marker is malformed; publication transitions remain blocked.', 409); }
+      if (!parsed || typeof parsed !== 'object' || (parsed as { requiresShopifyReconciliation?: unknown }).requiresShopifyReconciliation !== true) throw new PublicationError('The restoration marker does not contain the required reconciliation directive.', 409);
+      const markerFingerprint = this.hash(marker);
+      return { pending: true, eligible: false, markerFingerprint, confirmationText: `CLEAR RESTORATION ${markerFingerprint}`, products: [], errors: ['Read-only Shopify reconciliation and explicit clearance are required.'] };
+    } catch (error) {
+      if (error instanceof PublicationError) throw error;
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { pending: false, eligible: true, alreadyCleared: true, products: [], errors: [] };
+      throw new PublicationError('Restoration reconciliation state could not be read; publication transitions remain blocked.', 503);
+    }
+  }
+
+  async validateRestoration(): Promise<RestorationReconciliation> {
+    const status = await this.restorationStatus();
+    if (!status.pending) return status;
+    const operations = this.list();
+    const globalErrors: string[] = [];
+    for (const operation of operations) {
+      const integrity = operationIntegrityErrors(operation);
+      if (integrity.length) globalErrors.push(`Operation ${operation.id} failed integrity validation: ${integrity.join(', ')}.`);
+      if (!NONBLOCKING_STATUSES.has(operation.status)) globalErrors.push(`Operation ${operation.id} is ${operation.status}; restored partial, conflicted, or uncertain operations require their existing manual recovery procedure.`);
+      if (operation.items.some((item) => item.intent || item.uncertainCreation || item.cleanupOutcome?.kind === 'cleanup_outcome_uncertain')) globalErrors.push(`Operation ${operation.id} contains unresolved or uncertain mutation evidence.`);
+    }
+    const byProduct = new Map<string, PublicationOperation[]>();
+    for (const operation of operations) byProduct.set(operation.productId, [...(byProduct.get(operation.productId) ?? []), operation]);
+    const products: RestorationProductReconciliation[] = [];
+    for (const [productId, productOperations] of byProduct) {
+      productOperations.sort((a, b) => a.updatedAt.localeCompare(b.updatedAt));
+      const controlling = productOperations.at(-1)!;
+      const result: RestorationProductReconciliation = { productId, operationIds: productOperations.map((item) => item.id), controllingOperationId: controlling.id, mediaIds: [], variantAssociations: [], errors: [] };
+      try {
+        const [product, state] = await Promise.all([this.shopify.getProduct(productId, false), this.shopify.getPublicationState(productId)]);
+        const structureError = snapshotStructureError(state);
+        if (structureError) result.errors.push(structureError);
+        if (product.id !== productId || product.title !== controlling.productTitle) result.errors.push('The live Shopify product identity does not match the latest immutable operation.');
+        result.mediaIds = [...state.mediaIds];
+        result.variantAssociations = state.variants.map((variant) => ({ variantId: variant.id, mediaIds: [...variant.mediaIds] }));
+        const generated = controlling.items.map((item) => item.createdMediaId).filter((id): id is string => Boolean(id));
+        let expectedMedia: string[] = [];
+        let expectedVariants: Array<{ variantId: string; mediaIds: string[] }> = [];
+        let outcome: RestorationReconciliationOutcome | undefined;
+        if (controlling.status === 'published') {
+          const terminalError = terminalPublicationError(controlling); if (terminalError) result.errors.push(`Published checkpoint is incomplete: ${terminalError}`);
+          expectedMedia = controlling.expectedPublishedMediaOrder;
+          expectedVariants = controlling.originalVariantMedia.map((original) => {
+            const owner = controlling.items.find((item) => item.variantIds.includes(original.variantId));
+            return { variantId: original.variantId, mediaIds: owner?.createdMediaId ? [owner.createdMediaId] : [] };
+          });
+          outcome = 'exactly_published';
+        } else if (controlling.status === 'rolled_back' || controlling.status === 'rolled_back_files_retained' || controlling.status === 'abandoned') {
+          if (controlling.status !== 'abandoned' && controlling.productRestored !== true) result.errors.push('Rollback terminal state lacks durable product-restoration evidence.');
+          if (controlling.status === 'rolled_back_files_retained' && !controlling.rollbackFinalizationEvidence) result.errors.push('Retained-file rollback lacks durable finalization evidence.');
+          if (controlling.status === 'abandoned' && (!controlling.abandonedAt || !controlling.abandonmentReason || !controlling.abandonmentEvidence?.snapshotComplete)) result.errors.push('Abandonment lacks durable verification evidence.');
+          expectedMedia = controlling.originalMediaOrder;
+          expectedVariants = controlling.originalVariantMedia;
+          outcome = controlling.status === 'abandoned' ? 'abandoned' : controlling.status === 'rolled_back_files_retained' ? 'rolled_back_files_retained' : 'exactly_rolled_back';
+          if (generated.some((id) => state.mediaIds.includes(id)) || state.variants.some((variant) => variant.mediaIds.some((id) => generated.includes(id)))) result.errors.push('Generated media remains referenced by the product or a variant.');
+        } else result.errors.push(`The latest operation status ${controlling.status} is not a safe restoration outcome.`);
+        if (!same(state.mediaIds, expectedMedia)) result.errors.push('Live media IDs or gallery ordering do not exactly match the safe expected state.');
+        const variantError = exactVariantError(expectedVariants, state.variants); if (variantError) result.errors.push(variantError);
+        if (!result.errors.length) result.outcome = outcome;
+      } catch (error) { result.errors.push(`Shopify snapshot could not be obtained: ${error instanceof Error ? error.message : 'unknown read failure'}`); }
+      products.push(result);
+    }
+    const errors = [...globalErrors, ...products.flatMap((product) => product.errors.map((error) => `${product.productId}: ${error}`))];
+    const stateDigest = this.hash(Buffer.from(JSON.stringify(products.map(({ productId, controllingOperationId, outcome, mediaIds, variantAssociations, errors }) => ({ productId, controllingOperationId, outcome, mediaIds, variantAssociations, errors })))));
+    return { ...status, eligible: errors.length === 0, verifiedAt: new Date().toISOString(), stateDigest, products, errors };
+  }
+
+  async clearRestoration(confirmation: string): Promise<RestorationReconciliation> {
+    if (this.restorationReconciliationRunning) throw new PublicationError('Restoration reconciliation is already running.', 409);
+    this.restorationReconciliationRunning = true;
+    try {
+      if (this.locks.size) throw new PublicationError('A publication state transition is already running; restoration reconciliation cannot start.', 409);
+      const status = await this.restorationStatus();
+      if (!status.pending) return status;
+      if (confirmation !== status.confirmationText) throw new PublicationError('Exact restoration-clearance confirmation including the marker fingerprint is required.', 400);
+      const first = await this.validateRestoration();
+      if (!first.eligible) throw new PublicationError(`Restoration cannot be cleared: ${first.errors.join(' ')}`, 409);
+      await mkdir(this.restorationEvidenceFolder, { recursive: true });
+      const evidencePath = path.join(this.restorationEvidenceFolder, `${new Date().toISOString().replace(/[:.]/g, '-')}-${status.markerFingerprint}.json`);
+      await this.checkpointWriter(evidencePath, JSON.stringify({ schemaVersion: 1, kind: 'restoration_reconciliation', ...first }, null, 2));
+      const second = await this.validateRestoration();
+      if (!second.eligible || second.markerFingerprint !== first.markerFingerprint || second.stateDigest !== first.stateDigest) throw new PublicationError('Restoration reconciliation became stale before clearance; the marker remains active.', 409);
+      const markerNow = await readFile(this.restorationMarker);
+      if (this.hash(markerNow) !== first.markerFingerprint) throw new PublicationError('The restoration marker changed during reconciliation; the marker remains active.', 409);
+      const clearedPath = path.join(path.dirname(this.restorationMarker), `RESTORED_FROM_BACKUP.cleared-${first.markerFingerprint}.json`);
+      await rename(this.restorationMarker, clearedPath);
+      return { ...second, pending: false, alreadyCleared: false, evidencePath: path.relative(path.dirname(this.restorationMarker), evidencePath) };
+    } catch (error) {
+      if (error instanceof PublicationError || error instanceof PublicationPersistenceError) throw error;
+      throw new PublicationPersistenceError('Restoration clearance failed; the marker remains active and all mutations stay blocked.', error);
+    } finally { this.restorationReconciliationRunning = false; }
+  }
   async validate(batchId: string): Promise<PublishReadiness> {
     const { batch, state, errors, colors, sourceFreshness } = await this.preflight(batchId);
     const existing = this.list().find((operation) => operation.batchId === batchId);
     if (existing) errors.push(`Batch ${batchId} already has publication operation ${existing.id}; generate a new batch for another publication.`);
     const blocker = this.blockingOperation(batch.productId);
     if (blocker) errors.push(`Publication operation ${blocker.id} must be rolled back or abandoned before a fresh publication.`);
+    const completed = this.completedReleaseOneOperation(batch.productId);
+    if (completed) errors.push(`Product already processed by completed Release 1 operation ${completed.id}; repeat background replacement is not supported.`);
     return { ready: !errors.length, batchId, productId: batch.productId, imageCount: colors.length, variantCount: colors.reduce((sum, item) => sum + item.variantIds.length, 0),
       currentGalleryImageCount: state.mediaIds.length, expectedFinalGalleryImageCount: colors.length, confirmationText: this.publicationConfirmation(batch.productId), replacesGallery: true,
       colors: colors.map(({ color, variantIds, previewId }) => ({ color, variantCount: variantIds.length, previewId })), sourceFreshness, errors };
@@ -162,6 +266,8 @@ export class PublishingService {
       if (confirmation !== this.publicationConfirmation(context.batch.productId)) throw new PublicationError(`Explicit publication confirmation for product ${context.batch.productId} is required.`, 400);
       const blocker = this.blockingOperation(context.batch.productId);
       if (blocker) throw new PublicationError(`Publication operation ${blocker.id} must be rolled back, finalized, or abandoned before a fresh publication.`, 409);
+      const completed = this.completedReleaseOneOperation(context.batch.productId);
+      if (completed) throw new PublicationError(`Product already processed by completed Release 1 operation ${completed.id}; repeat background replacement is not supported.`, 409);
       const predecessor = this.latestOperation(context.batch.productId);
       const now = new Date().toISOString();
       const operation: PublicationOperation = { id: crypto.randomUUID(), version: 1, batchId, productId: context.batch.productId, productTitle: context.batch.productTitle,
@@ -686,15 +792,18 @@ export class PublishingService {
   private blockingOperation(productId: string, allowedOperationId?: string) {
     return this.list().find((operation) => operation.productId === productId && operation.id !== allowedOperationId && !NONBLOCKING_STATUSES.has(operation.status));
   }
+  private completedReleaseOneOperation(productId: string) { return this.list().find((operation) => operation.productId === productId && COMPLETED_RELEASE_ONE_STATUSES.has(operation.status)); }
   private latestOperation(productId: string) { return this.list().find((operation) => operation.productId === productId); }
   private isSuperseded(operation: PublicationOperation) {
     return this.list().some((candidate) => candidate.productId === operation.productId && candidate.predecessorOperationId === operation.id);
   }
   private async withLock<T>(productId: string, action: () => Promise<T>) { if (this.locks.has(productId)) throw new PublicationError('Another publication or rollback is already running for this product.', 409); this.locks.add(productId); try { return await action(); } finally { this.locks.delete(productId); } }
   private async assertMutationAllowed(productId: string) {
+    if (this.restorationReconciliationRunning) throw new PublicationError('Restoration reconciliation is in progress; publication transitions remain blocked.', 503);
     if (this.persistenceBlockedProducts.has(productId)) throw new PublicationError('Local publication persistence previously failed for this product. Restart the API and reconcile the latest durable checkpoint before any further state transition.', 503);
-    try { await access(this.restorationMarker); throw new PublicationError('Restored local data requires complete operator-controlled Shopify reconciliation before any publication, recovery, rollback, abandonment, or finalization transition. Marker clearing is not implemented.', 503); }
+    try { await access(this.restorationMarker); throw new PublicationError('Restored local data requires complete operator-controlled Shopify reconciliation before any publication, recovery, rollback, abandonment, or finalization transition.', 503); }
     catch (error) { if (error instanceof PublicationError) throw error; if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new PublicationError('Restoration reconciliation state could not be verified; all publication transitions are blocked.', 503); }
+    if (this.restorationReconciliationRunning) throw new PublicationError('Restoration reconciliation is in progress; publication transitions remain blocked.', 503);
   }
   private assertId(id: string) { if (!STRICT_UUID.test(id)) throw new PublicationError('Publication operation not found.', 404); }
 }

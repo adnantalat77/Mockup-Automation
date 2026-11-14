@@ -150,4 +150,11 @@ describe('publishing authorization', () => {
     expect(verification.status).toBe(403); expect(finalization.status).toBe(403);
     expect(isPublishingOriginAllowed('https://attacker.example', 'http://127.0.0.1:3000', true)).toBe(false);
   });
+
+  it('protects restoration status, validation, and clearance routes while publishing is disabled', async () => {
+    const headers = { Origin: 'http://127.0.0.1:3000', 'X-Publish-Authorization': 'not-authorized' };
+    expect((await request(app).get('/api/publishing/restoration/status').set('X-Publish-Authorization', 'not-authorized')).status).toBe(403);
+    expect((await request(app).post('/api/publishing/restoration/validate').set(headers).send({})).status).toBe(403);
+    expect((await request(app).post('/api/publishing/restoration/clear').set(headers).send({ confirm: 'CLEAR RESTORATION invalid' })).status).toBe(403);
+  });
 });

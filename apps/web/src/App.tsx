@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import type { AbandonReadiness, ApiError, ImageAsset, MockupBatch, PublicationOperation, PublishReadiness, RecoveryReadiness, RollbackFinalizationReadiness, ShopifyProductDetail, ShopifyProductSummary, ShopifyStatus } from '@mockup-automation/shared';
+import type { AbandonReadiness, ApiError, ImageAsset, MockupBatch, PublicationOperation, PublishReadiness, RecoveryReadiness, RestorationReconciliation, RollbackFinalizationReadiness, ShopifyProductDetail, ShopifyProductSummary, ShopifyStatus } from '@mockup-automation/shared';
 import { validateAndRefreshHistory } from './publishing-state.js';
 
 // Development stays same-origin through Vite's /api proxy. A production host
@@ -163,7 +163,7 @@ function BatchPanel({ product, background, onBatch }: { product?: ShopifyProduct
 }
 
 function PublishingPanel({ batch, product }: { batch?: MockupBatch; product?: ShopifyProductDetail }) {
-  const [status, setStatus] = useState<{ enabled: boolean; reason?: string }>({ enabled: false });
+  const [status, setStatus] = useState<{ enabled: boolean; restorationPending?: boolean; reason?: string }>({ enabled: false });
   const [authorization, setAuthorization] = useState('');
   const [readiness, setReadiness] = useState<PublishReadiness>();
   const [history, setHistory] = useState<PublicationOperation[]>([]);
@@ -173,6 +173,7 @@ function PublishingPanel({ batch, product }: { batch?: MockupBatch; product?: Sh
   const [abandonReview, setAbandonReview] = useState<{ operation: PublicationOperation; readiness: AbandonReadiness }>();
   const [recoveryReview, setRecoveryReview] = useState<{ operation: PublicationOperation; readiness: RecoveryReadiness }>();
   const [finalizationReview, setFinalizationReview] = useState<{ operation: PublicationOperation; readiness: RollbackFinalizationReadiness }>();
+  const [restorationReview, setRestorationReview] = useState<RestorationReconciliation>();
 
   useEffect(() => { void apiJson<{ enabled: boolean; reason?: string }>('/api/publishing/status').then(setStatus); }, []);
   const authorized = (path: string, init: RequestInit = {}) => apiJson<any>(path, { ...init, headers: { 'Content-Type': 'application/json', 'X-Publish-Authorization': authorization, ...(init.headers ?? {}) } });
@@ -264,11 +265,29 @@ function PublishingPanel({ batch, product }: { batch?: MockupBatch; product?: Sh
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'Abandonment failed.'); }
     finally { setBusy(false); }
   }
+  async function verifyRestoration() {
+    setBusy(true); setError(''); setRestorationReview(undefined);
+    try { setRestorationReview(await authorized('/api/publishing/restoration/validate', { method: 'POST', body: '{}' })); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : 'Restoration reconciliation failed.'); }
+    finally { setBusy(false); }
+  }
+  async function clearRestoration() {
+    if (!restorationReview?.eligible || !restorationReview.confirmationText) return;
+    const confirmation = window.prompt(`This records reconciliation evidence and clears the restored-data mutation block. Type exactly:\n${restorationReview.confirmationText}`);
+    if (confirmation !== restorationReview.confirmationText) return;
+    setBusy(true); setError('');
+    try {
+      await authorized('/api/publishing/restoration/clear', { method: 'POST', body: JSON.stringify({ confirm: confirmation }) });
+      setRestorationReview(undefined); setStatus({ enabled: true }); await refreshHistorySafely();
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Restoration clearance failed; the mutation block remains active.'); }
+    finally { setBusy(false); }
+  }
   return <section className={`panel ${status.enabled ? '' : 'disabled'}`}><div className="section-number">04</div><div className="section-heading"><div><h2>Publishing and Rollback</h2><p>Explicitly validate, approve, publish, and restore a completed batch.</p></div><span className={status.enabled ? 'local' : 'future'}>{status.enabled ? 'Server enabled' : 'Disabled by default'}</span></div>
     {!status.enabled && <div className="notice">{status.reason ?? 'Publishing is disabled.'}</div>}
-    <div className="publish-auth"><input type="password" autoComplete="off" placeholder="Local publishing authorization" value={authorization} onChange={(event) => setAuthorization(event.target.value)} disabled={!status.enabled}/><button disabled={!status.enabled || !authorization || busy} onClick={() => void refreshHistorySafely()}>Load publication history</button><button disabled={!status.enabled || !authorization || !batch || busy} onClick={() => void validate()}>Validate new publication</button></div>
+    <div className="publish-auth"><input type="password" autoComplete="off" placeholder="Local publishing authorization" value={authorization} onChange={(event) => setAuthorization(event.target.value)} disabled={!status.enabled && !status.restorationPending}/>{status.restorationPending && <button disabled={!authorization || busy} onClick={() => void verifyRestoration()}>Reconcile Restored Data</button>}<button disabled={!status.enabled || !authorization || busy} onClick={() => void refreshHistorySafely()}>Load publication history</button><button disabled={!status.enabled || !authorization || !batch || busy} onClick={() => void validate()}>Validate new publication</button></div>
     {error && <div className="error">{error}</div>}
     {historyError && <div className="notice" role="status">Publication history could not be refreshed: {historyError}</div>}
+    {restorationReview && <div className={restorationReview.eligible ? 'notice' : 'error'}><strong>Restoration reconciliation</strong>{restorationReview.eligible ? <><p>All restored operations and affected products match a complete, exact safe state. Clearance will re-read Shopify state, persist evidence, and leave normal publication preflight active.</p><button className="primary" disabled={busy} onClick={() => void clearRestoration()}>Clear Restored-Data Block</button></> : <p>{restorationReview.errors.join(' ')}</p>}</div>}
     {finalizationReview && <div className={finalizationReview.readiness.eligible ? 'notice' : 'error'}><strong>Rollback finalization verification: {finalizationReview.operation.id}</strong>{finalizationReview.readiness.eligible ? <><p>The original product media order and variant associations match the immutable snapshot. {finalizationReview.readiness.retainedFileCount} generated files remain globally {finalizationReview.readiness.evidence?.cleanupReason === 'global_deletion_prohibited_by_operator' ? 'because global deletion was explicitly prohibited by the operator.' : 'because deletion ownership could not be proven.'}</p><button className="primary" disabled={busy} onClick={() => void finalizeRestoredProduct()}>Finalize Restored Product</button></> : <p>{finalizationReview.readiness.errors.join(' ')}</p>}</div>}
     {recoveryReview && <div className={recoveryReview.readiness.eligible ? 'notice' : 'error'}><strong>Recovery verification: {recoveryReview.operation.id}</strong>{recoveryReview.readiness.eligible ? <><p>{recoveryReview.readiness.imageCount} image records and {recoveryReview.readiness.variantCount} variant mappings are consistent with the immutable operation. Original media IDs and associations remain recorded for rollback.</p><button className="primary" disabled={busy} onClick={() => void resumeSelected()}>Resume Publication</button></> : <p>{recoveryReview.readiness.errors.join(' ')}</p>}</div>}
     {abandonReview && <div className={abandonReview.readiness.eligible ? 'notice' : 'error'}><strong>Abandonment verification: {abandonReview.operation.id}</strong>{abandonReview.readiness.eligible ? <><p>Live product media order and all original variant associations match the immutable snapshot. No generated media from this operation remains attached.</p><button disabled={busy} onClick={() => void abandonSelected()}>Abandon Partial Operation</button></> : <p>{abandonReview.readiness.errors.join(' ')}</p>}</div>}

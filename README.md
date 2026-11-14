@@ -27,6 +27,8 @@ Publication and rollback recovery validate unique, complete Shopify snapshots; e
 
 Critical local records use flushed temporary writes and atomic promotion, asset reads enforce recorded SHA-256 evidence, and malformed batch recovery fails closed. Backups and restores are explicit offline operations protected by the API data-directory lock; restored state never automatically replays Shopify mutations. See [docs/TASK022_OPERATIONAL_RESILIENCE.md](docs/TASK022_OPERATIONAL_RESILIENCE.md).
 
+A marked restored data directory remains mutation-blocked until an authorized operator runs complete read-only Shopify reconciliation. Clearance accepts only an exact terminal published, rolled-back, retained-file rollback, or abandoned state for every affected product, records durable evidence, rechecks for drift, and atomically preserves the cleared marker. See [docs/TASK023_END_TO_END_STABILIZATION.md](docs/TASK023_END_TO_END_STABILIZATION.md).
+
 Open <http://127.0.0.1:3000>. The API listens on <http://127.0.0.1:3001>. During local development, Vite proxies same-origin `/api` requests to the API, avoiding browser CORS and `localhost` IPv4/IPv6 resolution differences. The environment file is optional because local defaults are built in. For separate-origin production hosting only, set `VITE_API_URL` to the deployed API origin.
 
 ```powershell
@@ -81,7 +83,7 @@ Before publishing, the API completely paginates product media, variants, and eac
 
 New publication readiness and partial-operation recovery are separate workflows. **Publish All** only creates a new operation when no nonterminal operation blocks the product. An eligible `partial` history entry is checked using its immutable operation and batch IDs plus a complete live snapshot, then continued with **Resume Publication**. The resume endpoint cannot create a new operation and reconciles live state again before continuing.
 
-A fully verified `published` operation is a completed, nonblocking audit record. A later background replacement requires a new Phase 3 batch and snapshots the gallery produced by the previous publication. The new operation durably records its predecessor; once that checkpoint exists, older operations cannot roll back over newer work. Startup decisions and checkpoint zero are serialized under the product lock. See [docs/TASK017A_PUBLICATION_LIFECYCLE.md](docs/TASK017A_PUBLICATION_LIFECYCLE.md).
+A fully verified `published` operation is a completed Release 1 audit record. Release 1 permits one background-replacement publication per product: any durable `published`, `rolled_back`, or `rolled_back_files_retained` operation makes later batches ineligible for a second independent publication. Partial operations must be resumed or recovered, while rollback remains available for the original operation. Verified abandonment of the narrowly scoped disposable test attempt may permit its intended clean retry. Startup decisions and checkpoint zero are serialized under the product lock. Historical predecessor fields remain readable without authorizing repeat replacement. See [docs/TASK017A_PUBLICATION_LIFECYCLE.md](docs/TASK017A_PUBLICATION_LIFECYCLE.md).
 
 Phase 3 preserves each validated transparent garment source unchanged in ignored local storage. This lets a later batch reuse the same color source after complete gallery replacement has detached the original from the Shopify product. Generated background composites are never promoted to garment sources.
 
@@ -116,6 +118,7 @@ Cleanup evidence distinguishes historical ownership-unproven retention from expl
 - Shopify Admin GraphQL 2026-10 does not expose a complete inverse list of product references from a file. The explicit rollback mode therefore preserves generated global files by operator direction and never attempts ownership verification or `fileDelete`.
 - Rollback results report product restoration separately from generated-file cleanup. `productRestored: true` means media ordering and variant associations match the original snapshot even when `cleanupConflicts` requires manual file cleanup.
 - A cached garment hash proves local integrity, not current artwork freshness. Detached, ambiguous, changed, unavailable, or provenance-free sources can generate inspection previews where safe but block publication.
+- Release 1 uses the current transparent Shopify media attached and reliably mapped to the exact product/color/variants as its input. Printful API integration, a permanent reusable garment-source library, supplier registries, and repeat background replacement are intentionally out of scope. Detached historical sources remain unable to authorize a new publication.
 - `rolled_back_files_retained` is terminal for publication locking, but the recorded retained files still require separate manual ownership review before any global deletion.
 - No Printful sync, AI generation, background removal, garment recoloring, pricing, inventory, SKU, or fulfillment mutations.
 - Metadata is local JSON beside the assets. SQLite remains reserved for a later phase when durable relational metadata is needed.

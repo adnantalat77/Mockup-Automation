@@ -1,4 +1,5 @@
-import { mkdir, mkdtemp, readdir, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
+import crypto from 'node:crypto';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import sharp from 'sharp';
@@ -16,6 +17,16 @@ const product: ShopifyProductDetail = {
 };
 const productionProduct: ShopifyProductDetail = { ...product, id: 'gid://shopify/Product/999', title: 'Allowlisted Production Shirt', handle: 'allowlisted-production-shirt', status: 'ACTIVE' };
 
+const releaseOneColors = ['Black', 'Navy', 'White'];
+const releaseOneProduct: ShopifyProductDetail = {
+  id: 'gid://shopify/Product/888', title: 'Release 1 Draft Shirt', handle: 'release-1-draft-shirt', status: 'DRAFT', colors: releaseOneColors, sizes: ['S', 'M', 'L'],
+  images: releaseOneColors.map((color, index) => ({ id: `gid://shopify/ProductImage/${700 + index}`, mediaId: `gid://shopify/MediaImage/${700 + index}`, url: `https://cdn.shopify.com/${color.toLowerCase()}-source.png`, associatedColors: [color], association: 'reliable', validation: 'transparent' })),
+  variants: releaseOneColors.flatMap((color, colorIndex) => ['S', 'M', 'L'].map((size, sizeIndex) => ({
+    id: `gid://shopify/ProductVariant/${7000 + colorIndex * 3 + sizeIndex}`, title: `${color} / ${size}`, color, size,
+    selectedOptions: [{ name: 'Color', value: color }, { name: 'Size', value: size }], associatedImageIds: [`gid://shopify/ProductImage/${700 + colorIndex}`]
+  })))
+};
+
 const largeColors = ['Black', 'Navy', 'White', 'Red', 'Green', 'Blue', 'Gray', 'Gold'];
 const largeProduct: ShopifyProductDetail = {
   id: 'gid://shopify/Product/999', title: 'Allowlisted Production Shirt', handle: 'allowlisted-shirt', status: 'ACTIVE', colors: largeColors,
@@ -32,13 +43,14 @@ async function waitBatch(service: BatchService, id: string) {
   throw new Error('Batch timeout');
 }
 
-async function fixture(overrides: Record<string, unknown> = {}, selectedProduct: ShopifyProductDetail = product, allowedProductIds: string[] = []) {
+async function fixture(overrides: Record<string, unknown> = {}, selectedProduct: ShopifyProductDetail = product, allowedProductIds: string[] = [], sourceDownloader?: (url: string) => Promise<Buffer>, selectedBackgroundBytes?: Buffer) {
   const root = await mkdtemp(path.join(tmpdir(), 'publish-'));
   const assets = new AssetStore(root); await assets.init();
-  const backgroundBytes = await sharp({ create: { width: 30, height: 30, channels: 3, background: '#fff' } }).png().toBuffer();
+  const backgroundBytes = selectedBackgroundBytes ?? await sharp({ create: { width: 30, height: 30, channels: 3, background: '#fff' } }).png().toBuffer();
   const garment = await sharp({ create: { width: 20, height: 20, channels: 4, background: { r: 20, g: 30, b: 40, alpha: 0.5 } } }).png().toBuffer();
   const background = await assets.save('background', backgroundBytes, 'png', { originalName: 'background.png', width: 30, height: 30 });
-  const reader = { getProduct: vi.fn().mockResolvedValue(selectedProduct), downloadImage: vi.fn().mockResolvedValue(garment) };
+  const downloadSource = sourceDownloader ?? (async () => garment);
+  const reader = { getProduct: vi.fn().mockResolvedValue(selectedProduct), downloadImage: vi.fn().mockImplementation(downloadSource) };
   const batches = new BatchService(root, assets, reader as any); await batches.init();
   const batch = await waitBatch(batches, (await batches.create(selectedProduct.id, background.id)).id);
   const originalMediaIds = selectedProduct.images.map((entry, index) => entry.id.startsWith('gid://shopify/MediaImage/') ? entry.id : `gid://shopify/MediaImage/${50 + index}`);
@@ -49,7 +61,7 @@ async function fixture(overrides: Record<string, unknown> = {}, selectedProduct:
   const api = {
     getProduct: vi.fn().mockResolvedValue(selectedProduct),
     getPublicationState: vi.fn().mockImplementation(async () => structuredClone(live)),
-    downloadImage: vi.fn().mockResolvedValue(garment),
+    downloadImage: vi.fn().mockImplementation(downloadSource),
     stageImage: vi.fn().mockResolvedValue('https://staged.example/image'),
     createImageFile: vi.fn().mockImplementation(async () => ({ id: `gid://shopify/MediaImage/${generatedStart + createdIndex++}`, fileStatus: 'PROCESSING' })),
     waitForFileReady: vi.fn().mockResolvedValue(undefined), addFileToProduct: vi.fn().mockImplementation(async (id: string) => { if (!live.mediaIds.includes(id)) live.mediaIds.push(id); }),
@@ -129,6 +141,96 @@ describe('PublishingService', () => {
     await expect(base.publishing.finalizeRollback(operation.id, `FINALIZE ${operation.id} FILES RETAINED`)).rejects.toMatchObject({ status: 503 });
     expect(base.api.getPublicationState).not.toHaveBeenCalled(); expect(base.api.createImageFile).not.toHaveBeenCalled(); expect(base.api.removeFileFromProduct).not.toHaveBeenCalled();
   });
+
+  it('reconciles an exact published restoration and clears the marker with durable evidence and zero mutations', async () => {
+    const base = await fixture(); const operation = await base.publishing.publish(base.batch.id);
+    const marker = path.join(base.root, 'RESTORED_FROM_BACKUP.json');
+    await writeFile(marker, JSON.stringify({ requiresShopifyReconciliation: true, restoredAt: '2026-11-13T00:00:00.000Z' }));
+    vi.clearAllMocks();
+    const readiness = await base.publishing.validateRestoration();
+    expect(readiness).toMatchObject({ pending: true, eligible: true, products: [{ productId: product.id, controllingOperationId: operation.id, outcome: 'exactly_published' }] });
+    const cleared = await base.publishing.clearRestoration(readiness.confirmationText!);
+    expect(cleared).toMatchObject({ pending: false, eligible: true, alreadyCleared: false });
+    await expect(access(marker)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(JSON.parse(await readFile(path.join(base.root, cleared.evidencePath!), 'utf8'))).toMatchObject({ schemaVersion: 1, kind: 'restoration_reconciliation', eligible: true });
+    expect(base.api.stageImage).not.toHaveBeenCalled(); expect(base.api.createImageFile).not.toHaveBeenCalled(); expect(base.api.addFileToProduct).not.toHaveBeenCalled();
+    expect(base.api.replaceVariantMedia).not.toHaveBeenCalled(); expect(base.api.removeFileFromProduct).not.toHaveBeenCalled(); expect(base.api.reorderMedia).not.toHaveBeenCalled();
+    await expect(base.publishing.clearRestoration(readiness.confirmationText!)).resolves.toMatchObject({ pending: false, alreadyCleared: true });
+  });
+
+  it('reconciles exact rolled-back retained-file state without treating globally retained files as product references', async () => {
+    const base = await retainedRollbackFixture();
+    const expected = `FINALIZE ${base.operation.id} FILES RETAINED`;
+    const finalized = await base.publishing.finalizeRollback(base.operation.id, expected);
+    await writeFile(path.join(base.root, 'RESTORED_FROM_BACKUP.json'), JSON.stringify({ requiresShopifyReconciliation: true }));
+    vi.clearAllMocks();
+    await expect(base.publishing.validateRestoration()).resolves.toMatchObject({ eligible: true, products: [{ controllingOperationId: finalized.id, outcome: 'rolled_back_files_retained' }] });
+    expect(base.api.createImageFile).not.toHaveBeenCalled(); expect(base.api.removeFileFromProduct).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['unexpected gallery media', (live: any) => live.mediaIds.push('gid://shopify/MediaImage/777'), /ordering/],
+    ['variant missing', (live: any) => live.variants.pop(), /variant set|missing/],
+    ['variant added', (live: any) => live.variants.push({ id: 'gid://shopify/ProductVariant/777', color: 'Black', mediaIds: [] }), /variant set|unexpected/],
+    ['variant association changed', (live: any) => { live.variants[0].mediaIds = ['gid://shopify/MediaImage/777']; }, /media changed/]
+  ])('keeps the restoration marker active when %s', async (_name, mutate, diagnostic) => {
+    const base = await fixture(); await base.publishing.publish(base.batch.id);
+    const marker = path.join(base.root, 'RESTORED_FROM_BACKUP.json'); await writeFile(marker, JSON.stringify({ requiresShopifyReconciliation: true }));
+    mutate(base.live); vi.clearAllMocks();
+    const readiness = await base.publishing.validateRestoration();
+    expect(readiness.eligible).toBe(false); expect(readiness.errors.join(' ')).toMatch(diagnostic);
+    await expect(base.publishing.clearRestoration(readiness.confirmationText!)).rejects.toMatchObject({ status: 409 });
+    await expect(access(marker)).resolves.toBeUndefined();
+    expect(base.api.createImageFile).not.toHaveBeenCalled(); expect(base.api.replaceVariantMedia).not.toHaveBeenCalled();
+  });
+
+  it('fails closed for incomplete snapshots, Shopify read failures, unresolved intents, and uncertain file ownership', async () => {
+    const base = await fixture(); const operation = await base.publishing.publish(base.batch.id);
+    await writeFile(path.join(base.root, 'RESTORED_FROM_BACKUP.json'), JSON.stringify({ requiresShopifyReconciliation: true }));
+    base.api.getPublicationState.mockResolvedValueOnce({ ...structuredClone(base.live), complete: false });
+    expect((await base.publishing.validateRestoration()).errors.join(' ')).toMatch(/incomplete/);
+    base.api.getPublicationState.mockRejectedValueOnce(new Error('read unavailable'));
+    expect((await base.publishing.validateRestoration()).errors.join(' ')).toMatch(/read unavailable/);
+    const item = base.publishing.get(operation.id).items[0]; item.intent = 'create_file'; item.uncertainCreation = true;
+    expect((await base.publishing.validateRestoration()).errors.join(' ')).toMatch(/unresolved or uncertain/);
+  });
+
+  it('persists reconciliation evidence first and refuses stale clearance without repeating any mutation', async () => {
+    const base = await fixture(); await base.publishing.publish(base.batch.id);
+    const marker = path.join(base.root, 'RESTORED_FROM_BACKUP.json'); await writeFile(marker, JSON.stringify({ requiresShopifyReconciliation: true }));
+    const status = await base.publishing.restorationStatus(); let reads = 0;
+    base.api.getPublicationState.mockImplementation(async () => { reads += 1; const state = structuredClone(base.live); if (reads >= 2) state.mediaIds.push('gid://shopify/MediaImage/777'); return state; });
+    vi.clearAllMocks();
+    await expect(base.publishing.clearRestoration(status.confirmationText!)).rejects.toMatchObject({ status: 409 });
+    await expect(access(marker)).resolves.toBeUndefined();
+    expect((await readdir(path.join(base.root, 'restoration-reconciliations'))).length).toBe(1);
+    expect(base.api.createImageFile).not.toHaveBeenCalled(); expect(base.api.reorderMedia).not.toHaveBeenCalled();
+  });
+
+  it('keeps the marker active when reconciliation evidence cannot be persisted', async () => {
+    const base = await fixture(); await base.publishing.publish(base.batch.id);
+    const marker = path.join(base.root, 'RESTORED_FROM_BACKUP.json'); await writeFile(marker, JSON.stringify({ requiresShopifyReconciliation: true }));
+    const writer = vi.fn(async (destination: string, data: string | Buffer) => {
+      if (destination.includes('restoration-reconciliations')) throw new PersistenceError('injected evidence failure', 'ENOSPC');
+      await atomicWriteFile(destination, data);
+    });
+    const recovered = new PublishingService(base.root, base.assets, base.batches, base.api as any, [], writer); await recovered.init();
+    const status = await recovered.restorationStatus(); vi.clearAllMocks();
+    await expect(recovered.clearRestoration(status.confirmationText!)).rejects.toThrow(/marker remains active/);
+    await expect(access(marker)).resolves.toBeUndefined();
+    expect(base.api.createImageFile).not.toHaveBeenCalled(); expect(base.api.replaceVariantMedia).not.toHaveBeenCalled();
+  });
+
+  it('allows an empty restored data set to be explicitly reconciled without Shopify access', async () => {
+    const base = await fixture();
+    const emptyRoot = await mkdtemp(path.join(tmpdir(), 'empty-restore-')); const assets = new AssetStore(emptyRoot); await assets.init();
+    const batches = new BatchService(emptyRoot, assets, { getProduct: base.api.getProduct, downloadImage: base.api.downloadImage } as any); await batches.init();
+    const publishing = new PublishingService(emptyRoot, assets, batches, base.api as any); await publishing.init();
+    await writeFile(path.join(emptyRoot, 'RESTORED_FROM_BACKUP.json'), JSON.stringify({ requiresShopifyReconciliation: true })); vi.clearAllMocks();
+    const readiness = await publishing.validateRestoration();
+    expect(readiness).toMatchObject({ pending: true, eligible: true, products: [] }); expect(base.api.getPublicationState).not.toHaveBeenCalled();
+    await expect(publishing.clearRestoration(readiness.confirmationText!)).resolves.toMatchObject({ pending: false, eligible: true });
+  });
   it('requires the explicit no_global_delete rollback mode before reading Shopify', async () => {
     const { batch, publishing, api } = await fixture();
     const published = await publishing.publish(batch.id);
@@ -147,6 +249,52 @@ describe('PublishingService', () => {
     expect(operation.status).toBe('published');
     expect(api.replaceVariantMedia).toHaveBeenCalledWith(product.id, 'gid://shopify/MediaImage/99', product.variants.map((variant) => variant.id));
     expect(api.appendVariantMedia).not.toHaveBeenCalled();
+  });
+
+  it('completes the Release 1 three-color nine-variant workflow and blocks a second independent publication', async () => {
+    const rgbByColor: Record<string, { r: number; g: number; b: number }> = { black: { r: 15, g: 16, b: 17 }, navy: { r: 20, g: 35, b: 90 }, white: { r: 235, g: 235, b: 235 } };
+    const sources = new Map<string, Buffer>();
+    for (const color of releaseOneColors) {
+      const foreground = await sharp({ create: { width: 10, height: 10, channels: 4, background: { ...rgbByColor[color.toLowerCase()], alpha: 1 } } }).png().toBuffer();
+      sources.set(color.toLowerCase(), await sharp({ create: { width: 20, height: 20, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } } }).composite([{ input: foreground, gravity: 'center' }]).png().toBuffer());
+    }
+    const background = await sharp({ create: { width: 30, height: 30, channels: 3, background: { r: 30, g: 150, b: 70 } } }).png().toBuffer();
+    const downloader = async (url: string) => {
+      const color = releaseOneColors.find((candidate) => url.includes(candidate.toLowerCase()));
+      if (!color) throw new Error('unexpected source URL');
+      return Buffer.from(sources.get(color.toLowerCase())!);
+    };
+    const base = await fixture({}, releaseOneProduct, [releaseOneProduct.id], downloader, background);
+    expect(base.batch).toMatchObject({ status: 'completed', counts: { total: 3, success: 3 } });
+    for (const item of base.batch.items) {
+      expect(item).toMatchObject({ status: 'success', sourceFreshness: { state: 'verified_current' }, sourceProvenance: { productId: releaseOneProduct.id, color: item.color }, generationEvidence: { backgroundAssetId: base.background.id } });
+      const preserved = (await base.assets.bytes('garment', item.sourceAsset!.id)).buffer;
+      const expectedSource = sources.get(item.color.toLowerCase())!;
+      expect(preserved.equals(expectedSource)).toBe(true);
+      expect(item.sourceProvenance!.sha256).toBe(crypto.createHash('sha256').update(expectedSource).digest('hex'));
+      const preview = (await base.assets.bytes('preview', item.preview!.id)).buffer;
+      expect(item.generationEvidence!.previewSha256).toBe(crypto.createHash('sha256').update(preview).digest('hex'));
+      const corner = await sharp(preview).extract({ left: 0, top: 0, width: 1, height: 1 }).removeAlpha().raw().toBuffer();
+      const center = await sharp(preview).extract({ left: 15, top: 15, width: 1, height: 1 }).removeAlpha().raw().toBuffer();
+      expect([...corner]).toEqual([30, 150, 70]);
+      const expectedForeground = rgbByColor[item.color.toLowerCase()];
+      expect([...center]).toEqual([expectedForeground.r, expectedForeground.g, expectedForeground.b]);
+    }
+    const readiness = await base.publishing.validate(base.batch.id);
+    expect(readiness).toMatchObject({ ready: true, imageCount: 3, variantCount: 9, expectedFinalGalleryImageCount: 3 });
+    const operation = await base.publishing.publish(base.batch.id, `PUBLISH ${releaseOneProduct.id}`);
+    expect(operation).toMatchObject({ status: 'published', publicationMode: 'replace_gallery' });
+    expect(operation.items).toHaveLength(3); expect(operation.completedSteps).toContain('published-order');
+    expect(base.live.mediaIds).toEqual(operation.expectedPublishedMediaOrder);
+    for (const item of operation.items) for (const variantId of item.variantIds) expect(base.live.variants.find((variant) => variant.id === variantId)?.mediaIds).toEqual([item.createdMediaId]);
+    const checkpointFiles = (await readdir(path.join(base.root, 'publications', operation.id))).filter((name) => /^\d{6}\.json$/.test(name));
+    const terminal = JSON.parse(await readFile(path.join(base.root, 'publications', operation.id, checkpointFiles.sort().at(-1)!), 'utf8'));
+    expect(terminal).toMatchObject({ id: operation.id, status: 'published', expectedPublishedMediaOrder: operation.expectedPublishedMediaOrder });
+    const secondBatch = await waitBatch(base.batches, (await base.batches.create(releaseOneProduct.id, base.background.id)).id);
+    const secondReadiness = await base.publishing.validate(secondBatch.id);
+    expect(secondReadiness.ready).toBe(false); expect(secondReadiness.errors.join(' ')).toMatch(/already processed.*repeat background replacement is not supported/i);
+    await expect(base.publishing.publish(secondBatch.id, `PUBLISH ${releaseOneProduct.id}`)).rejects.toMatchObject({ status: 409 });
+    expect(base.api.createImageFile).toHaveBeenCalledTimes(3);
   });
 
   it('revalidates a matching current source hash during final publication preflight', async () => {
@@ -241,23 +389,19 @@ describe('PublishingService', () => {
     expect(api.stageImage).not.toHaveBeenCalled(); expect(api.createImageFile).not.toHaveBeenCalled();
   });
 
-  it('supports sequential verified publications and rolls the second back only to the first gallery', async () => {
+  it('blocks sequential publication and preserves rollback of the single completed Release 1 operation', async () => {
     const { root, batch, background, batches, api, publishing, live } = await fixture();
     const first = await publishing.publish(batch.id);
     const firstCheckpointCount = (await readdir(path.join(root, 'publications', first.id))).filter((name) => name.endsWith('.json')).length;
     const secondBatch = await waitBatch(batches, (await batches.create(product.id, background.id)).id);
-    await expect(publishing.validate(secondBatch.id)).resolves.toMatchObject({ ready: true, currentGalleryImageCount: 1 });
-    const second = await publishing.publish(secondBatch.id);
-    expect(second.predecessorOperationId).toBe(first.id);
-    expect(second.originalMediaOrder).toEqual(['gid://shopify/MediaImage/99']);
-    expect(second.originalVariantMedia.every((entry) => entry.mediaIds[0] === 'gid://shopify/MediaImage/99')).toBe(true);
-    expect(live.mediaIds).toEqual(['gid://shopify/MediaImage/100']);
-    await expect(publishing.rollback(first.id, 'no_global_delete')).rejects.toMatchObject({ status: 409 });
-    await expect(publishing.rollback(second.id, 'no_global_delete')).resolves.toMatchObject({ status: 'conflict', productRestored: true });
+    await expect(publishing.validate(secondBatch.id)).resolves.toMatchObject({ ready: false, errors: [expect.stringMatching(/already processed/)] });
+    await expect(publishing.publish(secondBatch.id)).rejects.toMatchObject({ status: 409 });
     expect(live.mediaIds).toEqual(['gid://shopify/MediaImage/99']);
-    expect(live.variants.every((variant) => variant.mediaIds[0] === 'gid://shopify/MediaImage/99')).toBe(true);
-    expect((await readdir(path.join(root, 'publications', first.id))).filter((name) => name.endsWith('.json'))).toHaveLength(firstCheckpointCount);
-    expect(api.createImageFile).toHaveBeenCalledTimes(2);
+    await expect(publishing.rollback(first.id, 'no_global_delete')).resolves.toMatchObject({ status: 'conflict', productRestored: true });
+    expect(live.mediaIds).toEqual(['gid://shopify/MediaImage/50']);
+    expect(live.variants.every((variant) => variant.mediaIds[0] === 'gid://shopify/MediaImage/50')).toBe(true);
+    expect((await readdir(path.join(root, 'publications', first.id))).filter((name) => name.endsWith('.json')).length).toBeGreaterThan(firstCheckpointCount);
+    expect(api.createImageFile).toHaveBeenCalledTimes(1);
   });
 
   it.each([
@@ -294,15 +438,14 @@ describe('PublishingService', () => {
     await expect(publishing.publish(nextBatch.id)).rejects.toBeInstanceOf(PublicationError);
   });
 
-  it('preserves supersession and rollback blocking after restart', async () => {
+  it('preserves completed-product republish blocking after restart without impairing rollback', async () => {
     const { root, assets, background, batches, batch, api, publishing } = await fixture();
     const first = await publishing.publish(batch.id);
     const secondBatch = await waitBatch(batches, (await batches.create(product.id, background.id)).id);
-    const second = await publishing.publish(secondBatch.id);
     const recovered = new PublishingService(root, assets, batches, api as any); await recovered.init();
-    expect(recovered.get(second.id).predecessorOperationId).toBe(first.id);
-    await expect(recovered.rollback(first.id, 'no_global_delete')).rejects.toMatchObject({ status: 409 });
+    await expect(recovered.publish(secondBatch.id)).rejects.toMatchObject({ status: 409 });
     await expect(recovered.validate(secondBatch.id)).resolves.toMatchObject({ ready: false });
+    await expect(recovered.rollback(first.id, 'no_global_delete')).resolves.toMatchObject({ productRestored: true });
   });
 
   it('replaces an allowlisted 80-variant gallery with one generated image per color and fully restores it', async () => {
@@ -763,7 +906,7 @@ describe('PublishingService', () => {
     expect(unrelated.api.getPublicationState).not.toHaveBeenCalled();
   });
 
-  it('serializes finalization and allows future publication readiness only after terminal finalization', async () => {
+  it('serializes finalization and keeps a completed Release 1 product ineligible afterward', async () => {
     const { operation, publishing, api, batch, batches, background } = await retainedRollbackFixture();
     await expect(publishing.validate(batch.id)).resolves.toMatchObject({ ready: false });
     api.getPublicationState.mockImplementation(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); return structuredClone({ complete: true, mediaIds: ['gid://shopify/MediaImage/50'], variants: product.variants.map((variant) => ({ id: variant.id, color: variant.color, mediaIds: ['gid://shopify/MediaImage/50'] })) }); });
@@ -771,7 +914,7 @@ describe('PublishingService', () => {
     const [first, second] = await Promise.allSettled([publishing.finalizeRollback(operation.id, confirmation), publishing.finalizeRollback(operation.id, confirmation)]);
     expect([first.status, second.status].sort()).toEqual(['fulfilled', 'rejected']);
     const freshBatch = await waitBatch(batches, (await batches.create(product.id, background.id)).id);
-    await expect(publishing.validate(freshBatch.id)).resolves.toMatchObject({ ready: true });
+    await expect(publishing.validate(freshBatch.id)).resolves.toMatchObject({ ready: false, errors: [expect.stringMatching(/already processed/)] });
   });
 
   it('recovers from the latest complete checkpoint when a newer file is incomplete', async () => {
